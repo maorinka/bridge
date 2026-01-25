@@ -150,12 +150,19 @@ impl ScreenCapturer {
             CGMainDisplayID()
         });
 
-        // Get display dimensions
+        // Get native pixel resolution (actual hardware pixels, not scaled)
         let (native_width, native_height) = unsafe {
-            (
-                CGDisplayPixelsWide(display_id) as u32,
-                CGDisplayPixelsHigh(display_id) as u32,
-            )
+            let mode = CGDisplayCopyDisplayMode(display_id);
+            let dims = if !mode.is_null() {
+                let w = CGDisplayModeGetPixelWidth(mode) as u32;
+                let h = CGDisplayModeGetPixelHeight(mode) as u32;
+                CGDisplayModeRelease(mode);
+                (w, h)
+            } else {
+                // Fallback to scaled resolution
+                (CGDisplayPixelsWide(display_id) as u32, CGDisplayPixelsHigh(display_id) as u32)
+            };
+            dims
         };
 
         let target_width = if self.config.width > 0 { self.config.width } else { native_width };
@@ -416,6 +423,7 @@ pub struct CaptureStats {
 }
 
 /// Get information about available displays
+/// Returns native pixel resolution (actual hardware pixels, not scaled)
 pub fn get_displays() -> Vec<DisplayInfo> {
     unsafe {
         let mut displays = [0u32; 16];
@@ -428,11 +436,25 @@ pub fn get_displays() -> Vec<DisplayInfo> {
 
         displays[..count as usize]
             .iter()
-            .map(|&id| DisplayInfo {
-                id,
-                width: CGDisplayPixelsWide(id) as u32,
-                height: CGDisplayPixelsHigh(id) as u32,
-                is_main: CGDisplayIsMain(id),
+            .map(|&id| {
+                // Get native pixel resolution using CGDisplayMode
+                let mode = CGDisplayCopyDisplayMode(id);
+                let (width, height) = if !mode.is_null() {
+                    let w = CGDisplayModeGetPixelWidth(mode) as u32;
+                    let h = CGDisplayModeGetPixelHeight(mode) as u32;
+                    CGDisplayModeRelease(mode);
+                    (w, h)
+                } else {
+                    // Fallback to scaled resolution if mode unavailable
+                    (CGDisplayPixelsWide(id) as u32, CGDisplayPixelsHigh(id) as u32)
+                };
+
+                DisplayInfo {
+                    id,
+                    width,
+                    height,
+                    is_main: CGDisplayIsMain(id),
+                }
             })
             .collect()
     }

@@ -686,15 +686,39 @@ impl VideoDecoder {
                     as *mut c_void,
             };
 
+            // Create destination image buffer attributes to request BGRA output
+            let dest_attrs = CFDictionaryCreateMutable(
+                kCFAllocatorDefault,
+                1,
+                ptr::null(), // kCFTypeDictionaryKeyCallBacks
+                ptr::null(), // kCFTypeDictionaryValueCallBacks
+            );
+            let pixel_format: i32 = K_CV_PIXEL_FORMAT_TYPE_32BGRA as i32;
+            let pixel_format_num = CFNumberCreate(
+                kCFAllocatorDefault,
+                K_CF_NUMBER_SINT32_TYPE,
+                &pixel_format as *const i32 as *const c_void,
+            );
+            CFDictionarySetValue(
+                dest_attrs,
+                kCVPixelBufferPixelFormatTypeKey as CFTypeRef,
+                pixel_format_num as CFTypeRef,
+            );
+            debug!("Requesting BGRA output format from decoder");
+
             let mut session: VTDecompressionSessionRef = ptr::null_mut();
             let status = VTDecompressionSessionCreate(
                 kCFAllocatorDefault,
                 format_desc,
                 ptr::null(),
-                ptr::null(),
+                dest_attrs as CFDictionaryRef,
                 &callback_record,
                 &mut session,
             );
+
+            // Clean up the dictionary (session retains what it needs)
+            CFRelease(pixel_format_num as CFTypeRef);
+            CFRelease(dest_attrs as CFTypeRef);
 
             if status != NO_ERR {
                 return Err(BridgeError::Video(format!(
@@ -732,6 +756,11 @@ impl VideoDecoder {
             return Ok(());
         }
 
+        if self.format_desc.is_null() {
+            warn!("Format description is NULL - decoder not properly initialized");
+            return Ok(());
+        }
+
         // For keyframes, strip parameter sets and only decode the slice data
         let decode_data = if frame.is_keyframe {
             Self::strip_parameter_sets(&frame.data, self.codec)
@@ -744,10 +773,14 @@ impl VideoDecoder {
             return Ok(());
         }
 
+        // Log first bytes to verify format
+        if decode_data.len() >= 8 {
+            debug!("Decode data first 8 bytes: {:02x?}, total {} bytes",
+                   &decode_data[..8], decode_data.len());
+        }
+
         unsafe {
             // Create block buffer from encoded data
-            // Use CMBlockBufferCreateWithMemoryBlock with kCFAllocatorNull for the memory block
-            // and then copy the data into the buffer using CMBlockBufferReplaceDataBytes
             let mut block_buffer: CMBlockBufferRef = ptr::null_mut();
 
             let data_len = decode_data.len();
@@ -789,13 +822,17 @@ impl VideoDecoder {
             }
 
             // Create sample buffer
+            debug!("Creating sample buffer: format_desc={:?}, block_buffer={:?}, keyframe={}, data_len={}",
+                   self.format_desc, block_buffer, frame.is_keyframe, data_len);
+
+            // Create timing info for the sample
             let timing_info = CMSampleTimingInfo {
-                duration: CMTimeStruct::new(1, 60), // Assume 60fps
+                duration: CMTimeStruct::new(1, 60), // 1/60th second
                 presentation_time_stamp: CMTimeStruct::new(frame.pts_us as i64, 1_000_000),
-                decode_time_stamp: CMTimeStruct::new(frame.dts_us as i64, 1_000_000),
+                decode_time_stamp: CMTimeStruct::new(frame.pts_us as i64, 1_000_000),
             };
 
-            let sample_size = data_len;
+            let sample_size: usize = data_len;
 
             let mut sample_buffer: CMSampleBufferRef = ptr::null_mut();
             let status = CMSampleBufferCreate(
@@ -805,35 +842,35 @@ impl VideoDecoder {
                 ptr::null(),
                 ptr::null_mut(),
                 self.format_desc,
-                1,
-                1,
+                1,  // num_samples (as isize)
+                1,  // num_sample_timing_entries (as isize)
                 &timing_info,
-                1,
+                1,  // num_sample_size_entries (as isize)
                 &sample_size,
                 &mut sample_buffer,
             );
 
-            // Release the block buffer - sample buffer retains it if needed
-            CFRelease(block_buffer as CFTypeRef);
-
             if status != NO_ERR || sample_buffer.is_null() {
+                // Release block buffer on failure
+                CFRelease(block_buffer as CFTypeRef);
                 warn!("Failed to create sample buffer: {} (frame {}, {} bytes)",
                       status, frame.frame_number, data_len);
                 // Don't fail completely, just skip this frame
                 return Ok(());
             }
 
-            // Decode the frame
+            // Decode the frame synchronously
             let decode_status = VTDecompressionSessionDecodeFrame(
                 self.session,
                 sample_buffer,
-                0, // Sync decode
+                0, // Sync decode - waits for completion
                 ptr::null_mut(),
                 ptr::null_mut(),
             );
 
-            // Release sample buffer after decode
+            // Release sample buffer and block buffer after decode completes
             CFRelease(sample_buffer as CFTypeRef);
+            CFRelease(block_buffer as CFTypeRef);
 
             if decode_status != NO_ERR {
                 warn!("Decode failed with status: {} (frame {})", decode_status, frame.frame_number);

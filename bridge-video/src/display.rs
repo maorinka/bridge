@@ -61,12 +61,16 @@ impl MetalDisplay {
         layer.set_device(&self.device);
         layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
 
-        // Set drawable size using core_graphics_types
+        // Set drawable size to match video resolution exactly
         let size = core_graphics_types::geometry::CGSize::new(
             self.width as f64,
             self.height as f64,
         );
         layer.set_drawable_size(size);
+
+        // Set contents scale to 1.0 to prevent Retina upscaling
+        // This ensures 1:1 pixel mapping for the video
+        layer.set_contents_scale(1.0);
 
         // Disable vsync for lowest latency (may cause tearing)
         layer.set_display_sync_enabled(false);
@@ -74,7 +78,7 @@ impl MetalDisplay {
         // Use 2 drawables for double buffering
         layer.set_maximum_drawable_count(2);
 
-        info!("Metal layer configured: {}x{}", self.width, self.height);
+        info!("Metal layer configured: {}x{} (scale=1.0)", self.width, self.height);
         self.layer = Some(layer);
     }
 
@@ -163,9 +167,13 @@ impl MetalDisplay {
 
         // If we have a layer, render to screen
         if let Some(ref layer) = self.layer {
+            debug!("Rendering to layer, getting drawable...");
             // Get next drawable from CAMetalLayer
             let drawable = match layer.next_drawable() {
-                Some(d) => d,
+                Some(d) => {
+                    debug!("Got drawable");
+                    d
+                },
                 None => {
                     warn!("No drawable available, skipping frame");
                     return Ok(());
@@ -196,7 +204,7 @@ impl MetalDisplay {
             command_buffer.present_drawable(drawable);
             command_buffer.commit();
 
-            trace!("Rendered and presented frame {}", self.frame_count);
+            debug!("Frame {} presented to display", self.frame_count);
         } else {
             // No layer - just validate texture creation worked (useful for testing)
             trace!("Rendered frame {} (no layer)", self.frame_count);
@@ -209,9 +217,11 @@ impl MetalDisplay {
     fn create_texture_from_frame(&self, frame: &DecodedFrame) -> BridgeResult<metal::Texture> {
         // If we have an IOSurface, use zero-copy path
         if let Some(io_surface) = frame.io_surface {
+            debug!("Creating texture from IOSurface");
             return self.create_texture_from_iosurface(io_surface, frame.width, frame.height);
         }
 
+        debug!("Creating texture from raw data ({} bytes)", frame.data.len());
         // Fallback: create texture from pixel data
         let texture_desc = metal::TextureDescriptor::new();
         texture_desc.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
@@ -255,6 +265,26 @@ impl MetalDisplay {
 
             let base_address = IOSurfaceGetBaseAddress(io_surface);
             let bytes_per_row = IOSurfaceGetBytesPerRow(io_surface);
+            let pixel_format = IOSurfaceGetPixelFormat(io_surface);
+
+            // Expected BGRA = 0x42475241, NV12 (420v) = 0x34323076, NV12 (420f) = 0x34323066
+            // Check first few bytes of data for debugging
+            let first_bytes: [u8; 16] = if !base_address.is_null() {
+                let ptr = base_address as *const [u8; 16];
+                *ptr
+            } else {
+                [0; 16]
+            };
+
+            debug!(
+                "IOSurface: {}x{}, bytes_per_row={}, pixel_format=0x{:08X}, first_bytes={:02X?}, base_addr={:?}",
+                IOSurfaceGetWidth(io_surface),
+                IOSurfaceGetHeight(io_surface),
+                bytes_per_row,
+                pixel_format,
+                first_bytes,
+                base_address
+            );
 
             let texture_desc = metal::TextureDescriptor::new();
             texture_desc.set_pixel_format(MTLPixelFormat::BGRA8Unorm);

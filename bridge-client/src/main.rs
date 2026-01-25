@@ -26,10 +26,10 @@ use tracing_subscriber::FmtSubscriber;
 // macOS imports for window creation
 use objc2::rc::Retained;
 use objc2::{ClassType, MainThreadOnly};
-use objc2_foundation::{MainThreadMarker, NSString, NSPoint, NSSize, NSRect};
+use objc2_foundation::{MainThreadMarker, NSString, NSPoint, NSSize, NSRect, NSDefaultRunLoopMode};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSWindow, NSWindowStyleMask,
-    NSBackingStoreType, NSView,
+    NSBackingStoreType, NSView, NSEvent, NSEventMask,
 };
 use objc2_quartz_core::CAMetalLayer;
 use metal::foreign_types::ForeignType;
@@ -484,6 +484,24 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
 
         if shutdown_requested {
             break;
+        }
+
+        // Process macOS events to keep the window responsive
+        unsafe {
+            let app = NSApplication::sharedApplication(mtm);
+            loop {
+                let event = app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                    NSEventMask::Any,
+                    None, // Don't wait
+                    objc2_foundation::NSDefaultRunLoopMode,
+                    true,
+                );
+                match event {
+                    Some(e) => app.sendEvent(&e),
+                    None => break,
+                }
+            }
+            app.updateWindows();
         }
 
         // Receive video frames

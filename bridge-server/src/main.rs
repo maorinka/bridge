@@ -13,7 +13,7 @@ use bridge_transport::{
     BridgeConnection, QuicServer, ServiceAdvertiser, TransportConfig,
     DEFAULT_CONTROL_PORT,
 };
-use bridge_video::{CaptureConfig, EncoderConfig, ScreenCapturer, VideoEncoder};
+use bridge_video::{CaptureConfig, EncoderConfig, ScreenCapturer, VideoEncoder, get_displays, virtual_display::{VirtualDisplay, is_virtual_display_supported}};
 use bridge_input::InputInjector;
 use bridge_audio::{AudioCaptureConfig, AudioCapturer};
 use clap::Parser;
@@ -187,8 +187,43 @@ async fn handle_client(
     let video_config = hello.video_config;
     info!("Client requested: {}x{} @ {}fps", video_config.width, video_config.height, video_config.fps);
 
-    // Initialize components
-    let capture_config = CaptureConfig::from(&video_config);
+    // Check if we need a virtual display for the client's resolution
+    let displays = get_displays();
+    let main_display = displays.iter().find(|d| d.is_main).or(displays.first());
+    let server_resolution = main_display.map(|d| (d.width, d.height)).unwrap_or((1920, 1080));
+
+    info!("Server native display: {}x{}", server_resolution.0, server_resolution.1);
+
+    // Create virtual display if client wants higher resolution than server has
+    let virtual_display = if video_config.width > server_resolution.0 || video_config.height > server_resolution.1 {
+        if is_virtual_display_supported() {
+            info!("Creating virtual display at {}x{} for client", video_config.width, video_config.height);
+            match VirtualDisplay::new(video_config.width, video_config.height, video_config.fps) {
+                Ok(vd) => {
+                    info!("Virtual display created: ID={}", vd.display_id());
+                    Some(vd)
+                }
+                Err(e) => {
+                    warn!("Failed to create virtual display: {}. Using native resolution.", e);
+                    None
+                }
+            }
+        } else {
+            warn!("Virtual display not supported on this macOS version. Using native resolution.");
+            None
+        }
+    } else {
+        None
+    };
+
+    // Initialize capture - use virtual display if available
+    let mut capture_config = CaptureConfig::from(&video_config);
+    if let Some(ref vd) = virtual_display {
+        capture_config.display_id = Some(vd.display_id());
+        capture_config.width = vd.width();
+        capture_config.height = vd.height();
+    }
+
     let mut capturer = ScreenCapturer::new(capture_config)?;
 
     let mut encoder = if video_config.codec != bridge_common::VideoCodec::Raw {

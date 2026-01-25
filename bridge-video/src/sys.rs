@@ -21,6 +21,7 @@ pub type CFArrayRef = *const c_void;
 
 pub type OSStatus = i32;
 pub type CGDirectDisplayID = u32;
+pub type CGDisplayModeRef = *mut c_void;
 
 // IOSurface types
 pub type IOSurfaceRef = *mut c_void;
@@ -47,6 +48,15 @@ impl CMTimeStruct {
             value,
             timescale,
             flags: 1, // kCMTimeFlags_Valid
+            epoch: 0,
+        }
+    }
+
+    pub fn invalid() -> Self {
+        Self {
+            value: 0,
+            timescale: 0,
+            flags: 0, // kCMTimeFlags_Invalid
             epoch: 0,
         }
     }
@@ -128,6 +138,16 @@ extern "C" {
     ) -> CFNumberRef;
 }
 
+// CoreVideo pixel buffer keys
+#[link(name = "CoreVideo", kind = "framework")]
+extern "C" {
+    pub static kCVPixelBufferPixelFormatTypeKey: CFStringRef;
+}
+
+// Pixel format types
+pub const K_CV_PIXEL_FORMAT_TYPE_32BGRA: u32 = 0x42475241; // 'BGRA'
+pub const K_CF_NUMBER_SINT32_TYPE: i32 = 3; // kCFNumberSInt32Type
+
 #[link(name = "CoreMedia", kind = "framework")]
 extern "C" {
     pub fn CMSampleBufferGetImageBuffer(sbuf: CMSampleBufferRef) -> CVImageBufferRef;
@@ -188,6 +208,7 @@ extern "C" {
     ) -> OSStatus;
 
     // Sample buffer creation for decoding
+    // Note: CMItemCount is CFIndex which is signed long (isize on 64-bit)
     pub fn CMSampleBufferCreate(
         allocator: CFAllocatorRef,
         data_buffer: CMBlockBufferRef,
@@ -195,10 +216,10 @@ extern "C" {
         make_data_ready_callback: *const c_void,
         make_data_ready_refcon: *mut c_void,
         format_description: CMFormatDescriptionRef,
-        num_samples: i32,
-        num_sample_timing_entries: i32,
+        num_samples: isize,
+        num_sample_timing_entries: isize,
         sample_timing_array: *const CMSampleTimingInfo,
-        num_sample_size_entries: i32,
+        num_sample_size_entries: isize,
         sample_size_array: *const usize,
         sample_buffer_out: *mut CMSampleBufferRef,
     ) -> OSStatus;
@@ -372,6 +393,7 @@ extern "C" {
     pub fn IOSurfaceGetWidth(surface: IOSurfaceRef) -> usize;
     pub fn IOSurfaceGetHeight(surface: IOSurfaceRef) -> usize;
     pub fn IOSurfaceGetBytesPerRow(surface: IOSurfaceRef) -> usize;
+    pub fn IOSurfaceGetPixelFormat(surface: IOSurfaceRef) -> u32;
     pub fn IOSurfaceLock(surface: IOSurfaceRef, options: u32, seed: *mut u32) -> OSStatus;
     pub fn IOSurfaceUnlock(surface: IOSurfaceRef, options: u32, seed: *mut u32) -> OSStatus;
     pub fn IOSurfaceGetBaseAddress(surface: IOSurfaceRef) -> *mut c_void;
@@ -464,6 +486,12 @@ extern "C" {
     pub fn CGMainDisplayID() -> CGDirectDisplayID;
     pub fn CGDisplayPixelsWide(display: CGDirectDisplayID) -> usize;
     pub fn CGDisplayPixelsHigh(display: CGDirectDisplayID) -> usize;
+
+    // Native resolution (actual pixels, not scaled)
+    pub fn CGDisplayModeGetPixelWidth(mode: CGDisplayModeRef) -> usize;
+    pub fn CGDisplayModeGetPixelHeight(mode: CGDisplayModeRef) -> usize;
+    pub fn CGDisplayCopyDisplayMode(display: CGDirectDisplayID) -> CGDisplayModeRef;
+    pub fn CGDisplayModeRelease(mode: CGDisplayModeRef);
     pub fn CGDisplayIsMain(display: CGDirectDisplayID) -> bool;
     pub fn CGGetActiveDisplayList(
         max_displays: u32,
