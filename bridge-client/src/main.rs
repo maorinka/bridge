@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use bridge_common::{
-    AudioConfig, ControlMessage, InputEvent, LatencyReport, VideoConfig, now_us, elapsed_us,
+    ControlMessage, LatencyReport, elapsed_us,
 };
 use bridge_transport::{
     BridgeConnection, ServiceBrowser, TransportConfig, DEFAULT_CONTROL_PORT,
@@ -142,8 +142,37 @@ async fn main() -> Result<()> {
     let mut last_latency_report = tokio::time::Instant::now();
     let latency_report_interval = tokio::time::Duration::from_secs(1);
 
+    // Set up signal handlers for graceful shutdown
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("Failed to set up SIGTERM handler");
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .expect("Failed to set up SIGINT handler");
+
+    let mut shutdown_requested = false;
+
     // Main client loop
     loop {
+        // Check for shutdown signals (non-blocking)
+        tokio::select! {
+            biased;
+
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM, gracefully disconnecting...");
+                shutdown_requested = true;
+            }
+            _ = sigint.recv() => {
+                info!("Received SIGINT, gracefully disconnecting...");
+                shutdown_requested = true;
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_micros(1)) => {
+                // Continue with normal processing
+            }
+        }
+
+        if shutdown_requested {
+            break;
+        }
+
         // Receive video frames
         if let Some(video_ch) = conn.video_channel() {
             match tokio::time::timeout(
@@ -261,7 +290,7 @@ async fn main() -> Result<()> {
 }
 
 async fn discover_server() -> Result<SocketAddr> {
-    let mut browser = ServiceBrowser::new().await?;
+    let browser = ServiceBrowser::new().await?;
 
     let timeout = tokio::time::Duration::from_secs(10);
     let start = tokio::time::Instant::now();

@@ -4,12 +4,12 @@
 //! a DriverKit AudioServerPlugin virtual device would be ideal.
 //! This module provides the Rust side of the capture interface.
 
-use bridge_common::{BridgeResult, BridgeError, AudioConfig, AudioPacketHeader, now_us};
+use bridge_common::{BridgeResult, BridgeError, AudioConfig, now_us};
 use bytes::Bytes;
 use std::sync::Arc;
 use parking_lot::Mutex;
 use crossbeam_channel::{bounded, Receiver, Sender};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 /// Captured audio packet
@@ -131,7 +131,8 @@ impl AudioCapturer {
 
         let packet_tx = self.packet_tx.clone();
         let sequence = self.sequence.clone();
-        let sample_rate = self.config.sample_rate;
+        let _sample_rate = self.config.sample_rate;
+        let channels = self.config.channels as u32;
 
         // Create input stream for f32 samples
         let stream = device
@@ -150,7 +151,7 @@ impl AudioCapturer {
                     let packet = AudioPacket {
                         data: Bytes::from(bytes),
                         pts_us: timestamp,
-                        sample_count: data.len() as u32 / 2, // Stereo
+                        sample_count: data.len() as u32 / channels, // Divide by actual channel count
                         sequence: *seq,
                     };
 

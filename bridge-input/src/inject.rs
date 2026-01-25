@@ -8,8 +8,6 @@ use bridge_common::{
     BridgeResult, BridgeError, InputEvent, KeyboardEvent, MouseMoveEvent,
     MouseButtonEvent, MouseScrollEvent, ModifierFlags,
 };
-use std::ffi::c_void;
-use std::ptr;
 use tracing::{debug, trace, warn};
 
 use crate::sys::*;

@@ -2,13 +2,12 @@
 //!
 //! Provides low-latency audio playback with configurable buffer sizes.
 
-use bridge_common::{BridgeResult, BridgeError, AudioConfig, now_us};
-use bytes::Bytes;
+use bridge_common::{BridgeResult, BridgeError, AudioConfig};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use parking_lot::Mutex;
-use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
-use tracing::{debug, error, info, trace, warn};
+use crossbeam_channel::{bounded, Sender};
+use tracing::{debug, error, info};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use crate::AudioPacket;
@@ -71,7 +70,7 @@ impl AudioPlayer {
     /// Create a new audio player
     pub fn new(config: PlaybackConfig) -> BridgeResult<Self> {
         // Buffer for incoming samples
-        let (sample_tx, sample_rx) = bounded::<Vec<f32>>(config.buffer_count as usize * 2);
+        let (sample_tx, _sample_rx) = bounded::<Vec<f32>>(config.buffer_count as usize * 2);
 
         Ok(Self {
             config,

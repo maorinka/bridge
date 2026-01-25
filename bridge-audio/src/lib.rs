@@ -10,7 +10,7 @@ pub mod playback;
 pub use capture::*;
 pub use playback::*;
 
-use bridge_common::{AudioConfig, AudioCodec};
+use bridge_common::AudioConfig;
 
 /// Calculate bytes per audio sample
 pub fn bytes_per_sample(config: &AudioConfig) -> usize {

@@ -395,13 +395,13 @@ extern "C" fn event_tap_callback(
 
         CGEventType::ScrollWheel => {
             let delta_y = unsafe {
-                CGEventGetDoubleValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1 as u32)
+                CGEventGetDoubleValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1)
             };
             let delta_x = unsafe {
-                CGEventGetDoubleValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2 as u32)
+                CGEventGetDoubleValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2)
             };
             let is_continuous = unsafe {
-                CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS as u32) != 0
+                CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS) != 0
             };
 
             let input_event = InputEvent::MouseScroll(MouseScrollEvent {

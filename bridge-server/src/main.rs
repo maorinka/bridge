@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use bridge_common::{
-    AudioConfig, ControlMessage, InputEvent, VideoConfig,
+    AudioConfig, ControlMessage, InputEvent, VideoConfig, VideoFrameHeader,
 };
 use bridge_transport::{
     BridgeConnection, QuicServer, ServiceAdvertiser, TransportConfig,
@@ -110,34 +110,55 @@ async fn main() -> Result<()> {
     let _advertiser = ServiceAdvertiser::new(&args.name, args.port).await?;
     info!("Advertising service via Bonjour");
 
-    // Accept connections
+    // Set up signal handlers for graceful shutdown
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("Failed to set up SIGTERM handler");
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .expect("Failed to set up SIGINT handler");
+
+    // Accept connections with graceful shutdown support
     loop {
         info!("Waiting for client connection...");
 
-        match server.accept().await {
-            Ok(control_conn) => {
-                let server_name = args.name.clone();
-                let transport_config = transport_config.clone();
-                let video_config = video_config.clone();
-                let audio_config = audio_config.clone();
+        tokio::select! {
+            accept_result = server.accept() => {
+                match accept_result {
+                    Ok(control_conn) => {
+                        let server_name = args.name.clone();
+                        let transport_config = transport_config.clone();
+                        let video_config = video_config.clone();
+                        let audio_config = audio_config.clone();
 
-                tokio::spawn(async move {
-                    if let Err(e) = handle_client(
-                        control_conn,
-                        &server_name,
-                        transport_config,
-                        video_config,
-                        audio_config,
-                    ).await {
-                        error!("Client session error: {}", e);
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_client(
+                                control_conn,
+                                &server_name,
+                                transport_config,
+                                video_config,
+                                audio_config,
+                            ).await {
+                                error!("Client session error: {}", e);
+                            }
+                        });
                     }
-                });
+                    Err(e) => {
+                        error!("Failed to accept connection: {}", e);
+                    }
+                }
             }
-            Err(e) => {
-                error!("Failed to accept connection: {}", e);
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM, shutting down gracefully...");
+                break;
+            }
+            _ = sigint.recv() => {
+                info!("Received SIGINT, shutting down gracefully...");
+                break;
             }
         }
     }
+
+    info!("Server shutdown complete");
+    Ok(())
 }
 
 async fn handle_client(
@@ -150,6 +171,7 @@ async fn handle_client(
     info!("Client connected from {}", control_conn.remote_addr());
 
     // Accept the connection and perform handshake
+    let max_packet_size = config.max_packet_size;
     let (mut conn, hello) = BridgeConnection::accept(control_conn, config, server_name).await?;
 
     info!("Handshake complete with client: {}", hello.client_name);
@@ -171,6 +193,10 @@ async fn handle_client(
     let mut input_injector = InputInjector::new()?;
 
     let mut is_streaming = false;
+    let mut video_frame_number: u64 = 0;
+
+    // Calculate fragment size based on MTU (leave room for headers)
+    let fragment_size = max_packet_size - bridge_common::PacketHeader::SIZE - VideoFrameHeader::SIZE - 64;
 
     info!("Server components initialized");
 
@@ -229,10 +255,41 @@ async fn handle_client(
 
                         while let Some(encoded) = enc.recv_frame() {
                             if let Some(video_ch) = conn.video_channel() {
-                                let _ = video_ch.send(
-                                    bridge_common::PacketType::Video,
-                                    &encoded.data,
-                                ).await;
+                                // Send with proper VideoFrameHeader and fragmentation
+                                let data = &encoded.data;
+                                let fragment_count = data.len().div_ceil(fragment_size);
+
+                                for (i, chunk) in data.chunks(fragment_size).enumerate() {
+                                    let frame_header = VideoFrameHeader {
+                                        frame_number: video_frame_number,
+                                        pts_us: encoded.pts_us,
+                                        is_keyframe: encoded.is_keyframe && i == 0,
+                                        frame_size: data.len() as u32,
+                                        fragment_index: i as u16,
+                                        fragment_count: fragment_count as u16,
+                                        width: video_config.width,
+                                        height: video_config.height,
+                                    };
+
+                                    let header_bytes = match bincode::serialize(&frame_header) {
+                                        Ok(b) => b,
+                                        Err(e) => {
+                                            warn!("Failed to serialize frame header: {}", e);
+                                            continue;
+                                        }
+                                    };
+
+                                    let mut packet = Vec::with_capacity(header_bytes.len() + chunk.len());
+                                    packet.extend_from_slice(&header_bytes);
+                                    packet.extend_from_slice(chunk);
+
+                                    let _ = video_ch.send(
+                                        bridge_common::PacketType::Video,
+                                        &packet,
+                                    ).await;
+                                }
+
+                                video_frame_number += 1;
                             }
                         }
                     }

@@ -6,8 +6,8 @@ use bridge_common::{
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, error, info, warn};
+use tokio::sync::RwLock;
+use tracing::{error, info};
 
 use crate::{QuicConnection, UdpChannel, TransportConfig};
 

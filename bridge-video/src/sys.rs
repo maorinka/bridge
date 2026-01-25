@@ -204,6 +204,13 @@ extern "C" {
         data_length: usize,
         flags: u32,
     ) -> OSStatus;
+
+    pub fn CMBlockBufferReplaceDataBytes(
+        source_bytes: *const c_void,
+        dest_buffer: CMBlockBufferRef,
+        offset_into_dest: usize,
+        data_length: usize,
+    ) -> OSStatus;
 }
 
 #[repr(C)]

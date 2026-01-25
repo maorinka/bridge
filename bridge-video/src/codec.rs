@@ -559,19 +559,21 @@ impl VideoDecoder {
 
         unsafe {
             // Create block buffer from encoded data
+            // Use CMBlockBufferCreateWithMemoryBlock with kCFAllocatorNull for the memory block
+            // and then copy the data into the buffer using CMBlockBufferReplaceDataBytes
             let mut block_buffer: CMBlockBufferRef = ptr::null_mut();
 
-            // We need to make a mutable copy of the data for CMBlockBuffer
-            let mut data_copy = frame.data.to_vec();
+            let data_len = frame.data.len();
 
+            // Create an empty block buffer that will allocate and own its memory
             let status = CMBlockBufferCreateWithMemoryBlock(
                 kCFAllocatorDefault,
-                data_copy.as_mut_ptr() as *mut c_void,
-                data_copy.len(),
-                kCFAllocatorDefault,
+                ptr::null_mut(),  // NULL = allocate new memory
+                data_len,
+                kCFAllocatorDefault,  // Block allocator for the memory
                 ptr::null(),
                 0,
-                data_copy.len(),
+                data_len,
                 0,
                 &mut block_buffer,
             );
@@ -583,6 +585,22 @@ impl VideoDecoder {
                 )));
             }
 
+            // Copy data into the block buffer - the buffer owns this memory
+            let copy_status = CMBlockBufferReplaceDataBytes(
+                frame.data.as_ptr() as *const c_void,
+                block_buffer,
+                0,
+                data_len,
+            );
+
+            if copy_status != NO_ERR {
+                CFRelease(block_buffer as CFTypeRef);
+                return Err(BridgeError::Video(format!(
+                    "Failed to copy data to block buffer: {}",
+                    copy_status
+                )));
+            }
+
             // Create sample buffer
             let timing_info = CMSampleTimingInfo {
                 duration: CMTimeStruct::new(1, 60), // Assume 60fps
@@ -590,7 +608,7 @@ impl VideoDecoder {
                 decode_time_stamp: CMTimeStruct::new(frame.dts_us as i64, 1_000_000),
             };
 
-            let sample_size = data_copy.len();
+            let sample_size = data_len;
 
             let mut sample_buffer: CMSampleBufferRef = ptr::null_mut();
             let status = CMSampleBufferCreate(
@@ -608,8 +626,8 @@ impl VideoDecoder {
                 &mut sample_buffer,
             );
 
-            // Don't forget to keep data_copy alive until decode completes
-            std::mem::forget(data_copy);
+            // Release the block buffer - sample buffer retains it if needed
+            CFRelease(block_buffer as CFTypeRef);
 
             if status != NO_ERR || sample_buffer.is_null() {
                 return Err(BridgeError::Video(format!(
@@ -636,22 +654,228 @@ impl VideoDecoder {
     }
 
     /// Extract parameter sets (SPS, PPS, optionally VPS) from NAL units in the data
+    ///
+    /// Supports both AVCC format (4-byte length prefix) and Annex B format (start codes)
     fn extract_parameter_sets(data: &[u8], codec: VideoCodec) -> Option<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> {
-        // This is a simplified implementation
-        // In practice, you'd parse the AVCC/HVCC format or Annex B format
+        if data.len() < 8 {
+            return None;
+        }
 
-        // For now, return None to indicate we can't parse
-        // A full implementation would:
-        // 1. Parse NAL unit headers
-        // 2. Identify SPS (type 7 for H.264, type 33 for H.265)
-        // 3. Identify PPS (type 8 for H.264, type 34 for H.265)
-        // 4. Identify VPS (type 32 for H.265 only)
+        // Try to detect format and extract NAL units
+        let nal_units = Self::parse_nal_units(data);
+        if nal_units.is_empty() {
+            debug!("No NAL units found in data");
+            return None;
+        }
 
-        debug!(
-            "Parameter set extraction not fully implemented for {:?}",
-            codec
-        );
-        None
+        match codec {
+            VideoCodec::H264 => Self::extract_h264_params(&nal_units),
+            VideoCodec::H265 => Self::extract_h265_params(&nal_units),
+            VideoCodec::Raw => None,
+        }
+    }
+
+    /// Parse NAL units from data (supports AVCC 4-byte length prefix and Annex B start codes)
+    fn parse_nal_units(data: &[u8]) -> Vec<&[u8]> {
+        let mut units = Vec::new();
+
+        // First, try AVCC format (4-byte big-endian length prefix)
+        if Self::try_parse_avcc(data, &mut units) {
+            return units;
+        }
+
+        // Fall back to Annex B format (start code prefix: 0x00 0x00 0x01 or 0x00 0x00 0x00 0x01)
+        Self::parse_annex_b(data, &mut units);
+        units
+    }
+
+    /// Try to parse AVCC format (4-byte length prefixed NAL units)
+    fn try_parse_avcc<'a>(data: &'a [u8], units: &mut Vec<&'a [u8]>) -> bool {
+        let mut offset = 0;
+        let mut found_valid = false;
+
+        while offset + 4 < data.len() {
+            let length = u32::from_be_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]) as usize;
+
+            // Sanity check: length should be reasonable
+            if length == 0 || length > data.len() - offset - 4 {
+                if !found_valid {
+                    // If we haven't found any valid units, this isn't AVCC format
+                    units.clear();
+                    return false;
+                }
+                break;
+            }
+
+            let nal_start = offset + 4;
+            let nal_end = nal_start + length;
+
+            if nal_end <= data.len() {
+                units.push(&data[nal_start..nal_end]);
+                found_valid = true;
+            }
+
+            offset = nal_end;
+        }
+
+        found_valid
+    }
+
+    /// Parse Annex B format (start code delimited NAL units)
+    fn parse_annex_b<'a>(data: &'a [u8], units: &mut Vec<&'a [u8]>) {
+        let mut i = 0;
+        let mut nal_start = None;
+
+        while i < data.len() {
+            // Look for start code (0x00 0x00 0x01 or 0x00 0x00 0x00 0x01)
+            let is_start_code = if i + 2 < data.len() && data[i] == 0 && data[i + 1] == 0 {
+                if data[i + 2] == 1 {
+                    Some(3) // 3-byte start code
+                } else if i + 3 < data.len() && data[i + 2] == 0 && data[i + 3] == 1 {
+                    Some(4) // 4-byte start code
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some(start_code_len) = is_start_code {
+                // Found a start code
+                if let Some(start) = nal_start {
+                    // End of previous NAL unit (excluding trailing zeros)
+                    let mut end = i;
+                    while end > start && data[end - 1] == 0 {
+                        end -= 1;
+                    }
+                    if end > start {
+                        units.push(&data[start..end]);
+                    }
+                }
+                nal_start = Some(i + start_code_len);
+                i += start_code_len;
+            } else {
+                i += 1;
+            }
+        }
+
+        // Don't forget the last NAL unit
+        if let Some(start) = nal_start {
+            if start < data.len() {
+                units.push(&data[start..]);
+            }
+        }
+    }
+
+    /// Extract H.264 parameter sets (SPS and PPS)
+    fn extract_h264_params(nal_units: &[&[u8]]) -> Option<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> {
+        let mut sps: Option<Vec<u8>> = None;
+        let mut pps: Option<Vec<u8>> = None;
+
+        for nal in nal_units {
+            if nal.is_empty() {
+                continue;
+            }
+
+            // H.264 NAL unit type is in bits 0-4 of the first byte
+            let nal_type = nal[0] & 0x1F;
+
+            match nal_type {
+                7 => {
+                    // SPS (Sequence Parameter Set)
+                    debug!("Found H.264 SPS ({} bytes)", nal.len());
+                    sps = Some(nal.to_vec());
+                }
+                8 => {
+                    // PPS (Picture Parameter Set)
+                    debug!("Found H.264 PPS ({} bytes)", nal.len());
+                    pps = Some(nal.to_vec());
+                }
+                _ => {}
+            }
+
+            // Stop once we have both
+            if sps.is_some() && pps.is_some() {
+                break;
+            }
+        }
+
+        match (sps, pps) {
+            (Some(s), Some(p)) => {
+                debug!("Extracted H.264 params: SPS={} bytes, PPS={} bytes", s.len(), p.len());
+                Some((s, p, None))
+            }
+            _ => {
+                debug!("Could not find both SPS and PPS");
+                None
+            }
+        }
+    }
+
+    /// Extract H.265/HEVC parameter sets (VPS, SPS, and PPS)
+    fn extract_h265_params(nal_units: &[&[u8]]) -> Option<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> {
+        let mut vps: Option<Vec<u8>> = None;
+        let mut sps: Option<Vec<u8>> = None;
+        let mut pps: Option<Vec<u8>> = None;
+
+        for nal in nal_units {
+            if nal.len() < 2 {
+                continue;
+            }
+
+            // H.265 NAL unit type is in bits 1-6 of the first byte
+            let nal_type = (nal[0] >> 1) & 0x3F;
+
+            match nal_type {
+                32 => {
+                    // VPS (Video Parameter Set)
+                    debug!("Found H.265 VPS ({} bytes)", nal.len());
+                    vps = Some(nal.to_vec());
+                }
+                33 => {
+                    // SPS (Sequence Parameter Set)
+                    debug!("Found H.265 SPS ({} bytes)", nal.len());
+                    sps = Some(nal.to_vec());
+                }
+                34 => {
+                    // PPS (Picture Parameter Set)
+                    debug!("Found H.265 PPS ({} bytes)", nal.len());
+                    pps = Some(nal.to_vec());
+                }
+                _ => {}
+            }
+
+            // Stop once we have all three
+            if vps.is_some() && sps.is_some() && pps.is_some() {
+                break;
+            }
+        }
+
+        match (sps, pps, vps) {
+            (Some(s), Some(p), Some(v)) => {
+                debug!(
+                    "Extracted H.265 params: VPS={} bytes, SPS={} bytes, PPS={} bytes",
+                    v.len(), s.len(), p.len()
+                );
+                Some((s, p, Some(v)))
+            }
+            (Some(s), Some(p), None) => {
+                // Some encoders don't include VPS in every keyframe
+                debug!("Extracted H.265 params without VPS: SPS={} bytes, PPS={} bytes", s.len(), p.len());
+                // We need VPS for H.265, so return None
+                warn!("H.265 stream missing VPS, cannot initialize decoder");
+                None
+            }
+            _ => {
+                debug!("Could not find required H.265 parameter sets");
+                None
+            }
+        }
     }
 
     /// Manually initialize with known parameter sets

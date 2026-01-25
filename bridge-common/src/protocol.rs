@@ -5,7 +5,6 @@
 //! - TCP/QUIC for control messages (reliable)
 
 use serde::{Deserialize, Serialize};
-use bytes::Bytes;
 
 /// Protocol version for compatibility checking
 pub const PROTOCOL_VERSION: u32 = 1;

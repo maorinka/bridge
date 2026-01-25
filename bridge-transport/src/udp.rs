@@ -63,7 +63,7 @@ impl UdpChannel {
     }
 
     /// Configure socket for low latency
-    fn configure_socket(socket: &UdpSocket) -> BridgeResult<()> {
+    fn configure_socket(_socket: &UdpSocket) -> BridgeResult<()> {
         // These would require platform-specific code
         // For now, we rely on default settings
         // TODO: Set SO_SNDBUF, SO_RCVBUF, IP_TOS for QoS
@@ -196,9 +196,21 @@ impl FrameSender {
         pts_us: u64,
         is_keyframe: bool,
     ) -> BridgeResult<()> {
+        self.send_frame_with_dimensions(data, pts_us, is_keyframe, 0, 0).await
+    }
+
+    /// Send a video frame with explicit dimensions, fragmenting if necessary
+    pub async fn send_frame_with_dimensions(
+        &mut self,
+        data: &[u8],
+        pts_us: u64,
+        is_keyframe: bool,
+        width: u32,
+        height: u32,
+    ) -> BridgeResult<()> {
         use bridge_common::VideoFrameHeader;
 
-        let fragment_count = (data.len() + self.fragment_size - 1) / self.fragment_size;
+        let fragment_count = data.len().div_ceil(self.fragment_size);
 
         for (i, chunk) in data.chunks(self.fragment_size).enumerate() {
             let frame_header = VideoFrameHeader {
@@ -208,8 +220,8 @@ impl FrameSender {
                 frame_size: data.len() as u32,
                 fragment_index: i as u16,
                 fragment_count: fragment_count as u16,
-                width: 0, // Set by caller
-                height: 0,
+                width,
+                height,
             };
 
             let header_bytes = bincode::serialize(&frame_header)
@@ -224,6 +236,16 @@ impl FrameSender {
 
         self.frame_number += 1;
         Ok(())
+    }
+
+    /// Get a reference to the underlying channel
+    pub fn channel(&self) -> &UdpChannel {
+        &self.channel
+    }
+
+    /// Get a mutable reference to the underlying channel
+    pub fn channel_mut(&mut self) -> &mut UdpChannel {
+        &mut self.channel
     }
 }
 
@@ -296,10 +318,8 @@ impl FrameReceiver {
 
                 // Reassemble frame
                 let mut frame_data = Vec::with_capacity(pending.total_size);
-                for fragment in pending.fragments {
-                    if let Some(data) = fragment {
-                        frame_data.extend_from_slice(&data);
-                    }
+                for data in pending.fragments.into_iter().flatten() {
+                    frame_data.extend_from_slice(&data);
                 }
 
                 // Clean up old pending frames

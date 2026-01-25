@@ -1,13 +1,115 @@
 //! Service discovery using Bonjour/mDNS
+//!
+//! Uses macOS native DNS-SD APIs for zero-configuration networking.
 
 use bridge_common::{BridgeResult, BridgeError, ServerInfo, Resolution};
+use std::ffi::{c_void, CStr, CString};
 use std::net::{IpAddr, SocketAddr};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::ptr;
 use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::{SERVICE_TYPE, SERVICE_DOMAIN, DEFAULT_CONTROL_PORT};
+use crate::{SERVICE_TYPE, SERVICE_DOMAIN};
+
+// DNS-SD FFI types
+type DNSServiceRef = *mut c_void;
+type DNSServiceFlags = u32;
+type DNSServiceErrorType = i32;
+
+const K_DNS_SERVICE_ERR_NO_ERROR: DNSServiceErrorType = 0;
+const K_DNS_SERVICE_FLAGS_ADD: DNSServiceFlags = 0x2;
+
+#[link(name = "System")]
+extern "C" {
+    fn DNSServiceRegister(
+        sd_ref: *mut DNSServiceRef,
+        flags: DNSServiceFlags,
+        interface_index: u32,
+        name: *const i8,
+        reg_type: *const i8,
+        domain: *const i8,
+        host: *const i8,
+        port: u16,
+        txt_len: u16,
+        txt_record: *const c_void,
+        callback: Option<extern "C" fn(
+            DNSServiceRef,
+            DNSServiceFlags,
+            DNSServiceErrorType,
+            *const i8,
+            *const i8,
+            *const i8,
+            *mut c_void,
+        )>,
+        context: *mut c_void,
+    ) -> DNSServiceErrorType;
+
+    fn DNSServiceBrowse(
+        sd_ref: *mut DNSServiceRef,
+        flags: DNSServiceFlags,
+        interface_index: u32,
+        reg_type: *const i8,
+        domain: *const i8,
+        callback: Option<extern "C" fn(
+            DNSServiceRef,
+            DNSServiceFlags,
+            u32,
+            DNSServiceErrorType,
+            *const i8,
+            *const i8,
+            *const i8,
+            *mut c_void,
+        )>,
+        context: *mut c_void,
+    ) -> DNSServiceErrorType;
+
+    fn DNSServiceResolve(
+        sd_ref: *mut DNSServiceRef,
+        flags: DNSServiceFlags,
+        interface_index: u32,
+        name: *const i8,
+        reg_type: *const i8,
+        domain: *const i8,
+        callback: Option<extern "C" fn(
+            DNSServiceRef,
+            DNSServiceFlags,
+            u32,
+            DNSServiceErrorType,
+            *const i8,
+            *const i8,
+            u16,
+            u16,
+            *const u8,
+            *mut c_void,
+        )>,
+        context: *mut c_void,
+    ) -> DNSServiceErrorType;
+
+    fn DNSServiceGetAddrInfo(
+        sd_ref: *mut DNSServiceRef,
+        flags: DNSServiceFlags,
+        interface_index: u32,
+        protocol: u32,
+        hostname: *const i8,
+        callback: Option<extern "C" fn(
+            DNSServiceRef,
+            DNSServiceFlags,
+            u32,
+            DNSServiceErrorType,
+            *const i8,
+            *const libc::sockaddr,
+            u32,
+            *mut c_void,
+        )>,
+        context: *mut c_void,
+    ) -> DNSServiceErrorType;
+
+    fn DNSServiceRefDeallocate(sd_ref: DNSServiceRef);
+    fn DNSServiceRefSockFD(sd_ref: DNSServiceRef) -> i32;
+    fn DNSServiceProcessResult(sd_ref: DNSServiceRef) -> DNSServiceErrorType;
+}
 
 /// Service discovery events
 #[derive(Debug, Clone)]
@@ -18,11 +120,42 @@ pub enum DiscoveryEvent {
     ServerLost(String),
 }
 
+/// Context for DNS-SD registration callback
+struct AdvertiserContext {
+    name: String,
+    registered: bool,
+}
+
 /// Service advertiser for servers
 pub struct ServiceAdvertiser {
     name: String,
     port: u16,
-    // In a full implementation, this would hold the Bonjour registration
+    service_ref: Option<DNSServiceRef>,
+    _context: Option<Box<AdvertiserContext>>,
+}
+
+unsafe impl Send for ServiceAdvertiser {}
+
+extern "C" fn register_callback(
+    _sd_ref: DNSServiceRef,
+    _flags: DNSServiceFlags,
+    error: DNSServiceErrorType,
+    name: *const i8,
+    reg_type: *const i8,
+    _domain: *const i8,
+    context: *mut c_void,
+) {
+    if error != K_DNS_SERVICE_ERR_NO_ERROR {
+        error!("DNS-SD registration failed with error: {}", error);
+        return;
+    }
+
+    let ctx = unsafe { &mut *(context as *mut AdvertiserContext) };
+    ctx.registered = true;
+
+    let name_str = unsafe { CStr::from_ptr(name) }.to_string_lossy();
+    let type_str = unsafe { CStr::from_ptr(reg_type) }.to_string_lossy();
+    info!("Service registered: {} ({})", name_str, type_str);
 }
 
 impl ServiceAdvertiser {
@@ -30,24 +163,76 @@ impl ServiceAdvertiser {
     pub async fn new(name: &str, port: u16) -> BridgeResult<Self> {
         info!("Advertising Bridge service '{}' on port {}", name, port);
 
-        // TODO: Implement actual Bonjour registration using dns-sd or similar
-        // For now, this is a placeholder
-        //
-        // In a full implementation:
-        // 1. Use the dns-sd crate or direct FFI to DNSServiceRegister
-        // 2. Register the service with type "_bridge._tcp" on the local domain
-        // 3. Include TXT records with resolution and other metadata
+        let name_cstr = CString::new(name).map_err(|_| BridgeError::Config("Invalid service name".into()))?;
+        let type_cstr = CString::new(SERVICE_TYPE).unwrap();
+        let domain_cstr = CString::new(SERVICE_DOMAIN).unwrap();
+
+        let mut context = Box::new(AdvertiserContext {
+            name: name.to_string(),
+            registered: false,
+        });
+
+        let context_ptr = &mut *context as *mut AdvertiserContext as *mut c_void;
+        let mut service_ref: DNSServiceRef = ptr::null_mut();
+
+        // Port must be in network byte order
+        let port_be = port.to_be();
+
+        let error = unsafe {
+            DNSServiceRegister(
+                &mut service_ref,
+                0, // No flags
+                0, // All interfaces
+                name_cstr.as_ptr(),
+                type_cstr.as_ptr(),
+                domain_cstr.as_ptr(),
+                ptr::null(), // Default host
+                port_be,
+                0, // No TXT record
+                ptr::null(),
+                Some(register_callback),
+                context_ptr,
+            )
+        };
+
+        if error != K_DNS_SERVICE_ERR_NO_ERROR {
+            return Err(BridgeError::Transport(format!(
+                "Failed to register DNS-SD service: error {}",
+                error
+            )));
+        }
+
+        // Process the registration in a background thread
+        // We use a thread instead of async because DNS-SD uses its own socket that we
+        // shouldn't interfere with using async I/O wrappers
+        let service_ref_copy = service_ref as usize;
+        std::thread::spawn(move || {
+            loop {
+                let result = unsafe {
+                    DNSServiceProcessResult(service_ref_copy as DNSServiceRef)
+                };
+                if result != K_DNS_SERVICE_ERR_NO_ERROR {
+                    break;
+                }
+            }
+        });
 
         Ok(Self {
             name: name.to_string(),
             port,
+            service_ref: Some(service_ref),
+            _context: Some(context),
         })
     }
 
     /// Stop advertising
     pub fn stop(&mut self) {
-        info!("Stopping service advertisement for '{}'", self.name);
-        // Deregister from Bonjour
+        if let Some(service_ref) = self.service_ref.take() {
+            info!("Stopping service advertisement for '{}'", self.name);
+            unsafe {
+                DNSServiceRefDeallocate(service_ref);
+            }
+        }
     }
 }
 
@@ -57,11 +242,152 @@ impl Drop for ServiceAdvertiser {
     }
 }
 
+/// Context for browser callbacks
+struct BrowserContext {
+    servers: Arc<RwLock<HashMap<String, ServerInfo>>>,
+    event_tx: mpsc::Sender<DiscoveryEvent>,
+}
+
+/// Context for resolve callback
+struct ResolveContext {
+    name: String,
+    servers: Arc<RwLock<HashMap<String, ServerInfo>>>,
+    event_tx: mpsc::Sender<DiscoveryEvent>,
+}
+
 /// Service browser for clients
 pub struct ServiceBrowser {
     servers: Arc<RwLock<HashMap<String, ServerInfo>>>,
     event_tx: mpsc::Sender<DiscoveryEvent>,
     event_rx: mpsc::Receiver<DiscoveryEvent>,
+    service_ref: Option<DNSServiceRef>,
+    _context: Option<Box<BrowserContext>>,
+}
+
+unsafe impl Send for ServiceBrowser {}
+
+extern "C" fn browse_callback(
+    _sd_ref: DNSServiceRef,
+    flags: DNSServiceFlags,
+    interface_index: u32,
+    error: DNSServiceErrorType,
+    name: *const i8,
+    reg_type: *const i8,
+    domain: *const i8,
+    context: *mut c_void,
+) {
+    if error != K_DNS_SERVICE_ERR_NO_ERROR {
+        error!("DNS-SD browse callback error: {}", error);
+        return;
+    }
+
+    let ctx = unsafe { &*(context as *const BrowserContext) };
+    let name_str = unsafe { CStr::from_ptr(name) }.to_string_lossy().to_string();
+    let type_str = unsafe { CStr::from_ptr(reg_type) }.to_string_lossy().to_string();
+    let domain_str = unsafe { CStr::from_ptr(domain) }.to_string_lossy().to_string();
+
+    if flags & K_DNS_SERVICE_FLAGS_ADD != 0 {
+        debug!("Found service: {} ({}) in {}", name_str, type_str, domain_str);
+
+        // Resolve the service to get host and port
+        let name_cstr = CString::new(name_str.clone()).unwrap();
+        let type_cstr = CString::new(type_str).unwrap();
+        let domain_cstr = CString::new(domain_str).unwrap();
+
+        let resolve_ctx = Box::new(ResolveContext {
+            name: name_str,
+            servers: ctx.servers.clone(),
+            event_tx: ctx.event_tx.clone(),
+        });
+
+        let resolve_ctx_ptr = Box::into_raw(resolve_ctx) as *mut c_void;
+        let mut resolve_ref: DNSServiceRef = ptr::null_mut();
+
+        let resolve_err = unsafe {
+            DNSServiceResolve(
+                &mut resolve_ref,
+                0,
+                interface_index,
+                name_cstr.as_ptr(),
+                type_cstr.as_ptr(),
+                domain_cstr.as_ptr(),
+                Some(resolve_callback),
+                resolve_ctx_ptr,
+            )
+        };
+
+        if resolve_err == K_DNS_SERVICE_ERR_NO_ERROR && !resolve_ref.is_null() {
+            // Process resolve result synchronously
+            unsafe {
+                DNSServiceProcessResult(resolve_ref);
+                DNSServiceRefDeallocate(resolve_ref);
+            }
+        } else {
+            // Clean up context on error
+            unsafe { drop(Box::from_raw(resolve_ctx_ptr as *mut ResolveContext)); }
+        }
+    } else {
+        // Service removed
+        debug!("Service removed: {}", name_str);
+        let servers = ctx.servers.clone();
+        let event_tx = ctx.event_tx.clone();
+
+        tokio::spawn(async move {
+            servers.write().await.remove(&name_str);
+            let _ = event_tx.send(DiscoveryEvent::ServerLost(name_str)).await;
+        });
+    }
+}
+
+extern "C" fn resolve_callback(
+    _sd_ref: DNSServiceRef,
+    _flags: DNSServiceFlags,
+    _interface_index: u32,
+    error: DNSServiceErrorType,
+    _fullname: *const i8,
+    host: *const i8,
+    port: u16,
+    _txt_len: u16,
+    _txt_record: *const u8,
+    context: *mut c_void,
+) {
+    let ctx = unsafe { Box::from_raw(context as *mut ResolveContext) };
+
+    if error != K_DNS_SERVICE_ERR_NO_ERROR {
+        error!("DNS-SD resolve callback error: {}", error);
+        return;
+    }
+
+    let host_str = unsafe { CStr::from_ptr(host) }.to_string_lossy().to_string();
+    let port_host = u16::from_be(port);
+
+    info!("Resolved service '{}' to {}:{}", ctx.name, host_str, port_host);
+
+    // Try to resolve the hostname to an IP address
+    let servers = ctx.servers.clone();
+    let event_tx = ctx.event_tx.clone();
+    let name = ctx.name.clone();
+
+    tokio::spawn(async move {
+        match resolve_hostname(&host_str).await {
+            Ok(ip) => {
+                let addr = SocketAddr::new(ip, port_host);
+                let info = ServerInfo {
+                    name: name.clone(),
+                    address: addr,
+                    hostname: host_str,
+                    resolution: Resolution::UHD_4K,
+                    available: true,
+                };
+
+                servers.write().await.insert(name, info.clone());
+                let _ = event_tx.send(DiscoveryEvent::ServerFound(info)).await;
+            }
+            Err(e) => {
+                warn!("Failed to resolve hostname {}: {}", host_str, e);
+            }
+        }
+    });
 }
 
 impl ServiceBrowser {
@@ -70,22 +396,57 @@ impl ServiceBrowser {
         let (event_tx, event_rx) = mpsc::channel(32);
         let servers = Arc::new(RwLock::new(HashMap::new()));
 
-        info!("Starting Bridge service browser");
+        info!("Starting Bridge service browser for {}", SERVICE_TYPE);
 
-        // TODO: Implement actual Bonjour browsing using dns-sd or similar
-        // For now, this is a placeholder
-        //
-        // In a full implementation:
-        // 1. Use DNSServiceBrowse to discover _bridge._tcp services
-        // 2. Use DNSServiceResolve to get the host and port
-        // 3. Use DNSServiceGetAddrInfo to get the IP address
-        // 4. Send DiscoveryEvent::ServerFound when a service is found
-        // 5. Send DiscoveryEvent::ServerLost when a service is removed
+        let context = Box::new(BrowserContext {
+            servers: servers.clone(),
+            event_tx: event_tx.clone(),
+        });
+
+        let context_ptr = Box::into_raw(context);
+        let type_cstr = CString::new(SERVICE_TYPE).unwrap();
+
+        let mut service_ref: DNSServiceRef = ptr::null_mut();
+
+        let error = unsafe {
+            DNSServiceBrowse(
+                &mut service_ref,
+                0, // No flags
+                0, // All interfaces
+                type_cstr.as_ptr(),
+                ptr::null(), // Default domain
+                Some(browse_callback),
+                context_ptr as *mut c_void,
+            )
+        };
+
+        if error != K_DNS_SERVICE_ERR_NO_ERROR {
+            unsafe { drop(Box::from_raw(context_ptr)); }
+            return Err(BridgeError::Transport(format!(
+                "Failed to start DNS-SD browse: error {}",
+                error
+            )));
+        }
+
+        // Process DNS-SD events in a background thread
+        let service_ref_copy = service_ref as usize;
+        std::thread::spawn(move || {
+            loop {
+                let result = unsafe {
+                    DNSServiceProcessResult(service_ref_copy as DNSServiceRef)
+                };
+                if result != K_DNS_SERVICE_ERR_NO_ERROR {
+                    break;
+                }
+            }
+        });
 
         Ok(Self {
             servers,
             event_tx,
             event_rx,
+            service_ref: Some(service_ref),
+            _context: Some(unsafe { Box::from_raw(context_ptr) }),
         })
     }
 
@@ -115,8 +476,12 @@ impl ServiceBrowser {
 
     /// Stop browsing
     pub fn stop(&mut self) {
-        info!("Stopping service browser");
-        // Stop the Bonjour browse operation
+        if let Some(service_ref) = self.service_ref.take() {
+            info!("Stopping service browser");
+            unsafe {
+                DNSServiceRefDeallocate(service_ref);
+            }
+        }
     }
 }
 

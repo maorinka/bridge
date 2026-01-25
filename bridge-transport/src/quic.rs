@@ -3,10 +3,15 @@
 use bridge_common::{BridgeError, BridgeResult, ControlMessage};
 use quinn::{ClientConfig, Connection, Endpoint, RecvStream, SendStream, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use sha2::{Sha256, Digest};
+use std::collections::HashMap;
+use std::fs;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
+use parking_lot::RwLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// QUIC connection for the control channel
 pub struct QuicConnection {
@@ -170,11 +175,13 @@ impl QuicServer {
     }
 }
 
-/// Configure QUIC client with self-signed certificate trust
+/// Configure QUIC client with Trust-On-First-Use (TOFU) certificate verification
 fn configure_client() -> ClientConfig {
+    let tofu_verifier = TofuCertificateVerifier::new();
+
     let crypto = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+        .with_custom_certificate_verifier(Arc::new(tofu_verifier))
         .with_no_client_auth();
 
     ClientConfig::new(Arc::new(
@@ -203,52 +210,160 @@ fn configure_server() -> BridgeResult<(ServerConfig, CertificateDer<'static>)> {
     Ok((server_config, cert_der))
 }
 
-/// Skip server certificate verification (for self-signed certs)
+/// Trust-On-First-Use (TOFU) certificate verifier
+///
+/// On first connection to a server, stores the certificate fingerprint.
+/// On subsequent connections, verifies the fingerprint matches.
+/// This prevents MITM attacks while allowing self-signed certificates.
 #[derive(Debug)]
-struct SkipServerVerification;
+struct TofuCertificateVerifier {
+    /// Map of server name to certificate fingerprint (SHA-256 hex)
+    known_hosts: Arc<RwLock<HashMap<String, String>>>,
+    /// Path to persist known hosts
+    storage_path: PathBuf,
+}
 
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+impl TofuCertificateVerifier {
+    fn new() -> Self {
+        let storage_path = Self::get_storage_path();
+        let known_hosts = Self::load_known_hosts(&storage_path);
+
+        Self {
+            known_hosts: Arc::new(RwLock::new(known_hosts)),
+            storage_path,
+        }
+    }
+
+    fn get_storage_path() -> PathBuf {
+        // Use ~/.bridge/known_hosts
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let bridge_dir = PathBuf::from(home).join(".bridge");
+        let _ = fs::create_dir_all(&bridge_dir);
+        bridge_dir.join("known_hosts")
+    }
+
+    fn load_known_hosts(path: &PathBuf) -> HashMap<String, String> {
+        if let Ok(content) = fs::read_to_string(path) {
+            content
+                .lines()
+                .filter_map(|line| {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        Some((parts[0].to_string(), parts[1].to_string()))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        }
+    }
+
+    fn save_known_hosts(&self) {
+        let hosts = self.known_hosts.read();
+        let content: String = hosts
+            .iter()
+            .map(|(name, fingerprint)| format!("{} {}", name, fingerprint))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if let Err(e) = fs::write(&self.storage_path, content) {
+            warn!("Failed to save known hosts: {}", e);
+        }
+    }
+
+    fn compute_fingerprint(cert: &CertificateDer<'_>) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(cert.as_ref());
+        let result = hasher.finalize();
+        hex::encode(result)
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for TofuCertificateVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
+        end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
+        server_name: &rustls::pki_types::ServerName<'_>,
         _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let server_name_str = server_name.to_str().to_string();
+        let fingerprint = Self::compute_fingerprint(end_entity);
+
+        // Check if we know this host
+        {
+            let hosts = self.known_hosts.read();
+            if let Some(stored_fingerprint) = hosts.get(&server_name_str) {
+                if stored_fingerprint == &fingerprint {
+                    debug!("Certificate fingerprint verified for {}", server_name_str);
+                    return Ok(rustls::client::danger::ServerCertVerified::assertion());
+                } else {
+                    // Certificate changed - this could be a MITM attack!
+                    error!(
+                        "CERTIFICATE CHANGED for {}! Stored: {}, Received: {}",
+                        server_name_str, stored_fingerprint, fingerprint
+                    );
+                    error!("This could indicate a man-in-the-middle attack.");
+                    error!("If the server certificate was legitimately changed, delete ~/.bridge/known_hosts");
+                    return Err(rustls::Error::General(
+                        "Server certificate fingerprint mismatch - possible MITM attack".into(),
+                    ));
+                }
+            }
+        }
+
+        // First connection - trust and store the certificate
+        info!(
+            "First connection to {} - storing certificate fingerprint: {}",
+            server_name_str, fingerprint
+        );
+
+        {
+            let mut hosts = self.known_hosts.write();
+            hosts.insert(server_name_str, fingerprint);
+        }
+
+        self.save_known_hosts();
+
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        // Use rustls's built-in verification
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        // Use rustls's built-in verification
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
-            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-            rustls::SignatureScheme::ED25519,
-        ]
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }

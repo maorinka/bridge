@@ -10,7 +10,7 @@ use std::ffi::{c_void, CString};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crossbeam_channel::{bounded, Receiver, Sender};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::sys::*;
 
@@ -93,7 +93,8 @@ pub struct ScreenCapturer {
     is_running: Arc<AtomicBool>,
     stream: Option<CGDisplayStreamRef>,
     queue: Option<DispatchQueueRef>,
-    context: Option<Box<CaptureContext>>,
+    /// Arc-wrapped context - the block callback holds a clone, preventing use-after-free
+    context: Option<Arc<CaptureContext>>,
 }
 
 unsafe impl Send for ScreenCapturer {}
@@ -172,20 +173,20 @@ impl ScreenCapturer {
             return Err(BridgeError::Video("Failed to create dispatch queue".into()));
         }
 
-        // Create capture context
-        let context = Box::new(CaptureContext {
+        // Create capture context wrapped in Arc for safe sharing with callback
+        let context = Arc::new(CaptureContext {
             frame_tx: self.frame_tx.clone(),
             frame_count: self.frame_count.clone(),
             width: target_width,
             height: target_height,
         });
-        let context_ptr = Box::into_raw(context);
 
         // Create the block for CGDisplayStream callback
         // CGDisplayStream handler signature:
         // void (^)(CGDisplayStreamFrameStatus status, uint64_t displayTime,
         //          IOSurfaceRef frameSurface, CGDisplayStreamUpdateRef updateRef)
-        let block = create_capture_block(context_ptr);
+        // The block holds an Arc clone, ensuring the context lives as long as needed
+        let block = create_capture_block(Arc::clone(&context));
 
         // Create CGDisplayStream
         // Using 'BGRA' pixel format (0x42475241)
@@ -203,9 +204,9 @@ impl ScreenCapturer {
 
         if stream.is_null() {
             unsafe {
-                let _ = Box::from_raw(context_ptr);
                 dispatch_release(queue);
             }
+            // context Arc will be dropped automatically when function returns
             return Err(BridgeError::Video("Failed to create CGDisplayStream. Check screen recording permission.".into()));
         }
 
@@ -213,16 +214,16 @@ impl ScreenCapturer {
         let result = unsafe { CGDisplayStreamStart(stream) };
         if result != 0 {
             unsafe {
-                let _ = Box::from_raw(context_ptr);
                 dispatch_release(queue);
                 CFRelease(stream as CFTypeRef);
             }
+            // context Arc will be dropped automatically
             return Err(BridgeError::Video(format!("Failed to start CGDisplayStream: {}", result)));
         }
 
         self.stream = Some(stream);
         self.queue = Some(queue);
-        self.context = Some(unsafe { Box::from_raw(context_ptr) });
+        self.context = Some(context);
         self.is_running.store(true, Ordering::SeqCst);
 
         info!("CGDisplayStream started successfully");
@@ -291,10 +292,11 @@ impl Drop for ScreenCapturer {
 
 /// Create the block callback for CGDisplayStream
 /// Returns a pointer to the block that can be passed to CGDisplayStreamCreateWithDispatchQueue
-fn create_capture_block(context_ptr: *mut CaptureContext) -> *const c_void {
+/// Takes an Arc<CaptureContext> which the callback will own, preventing use-after-free
+fn create_capture_block(context: Arc<CaptureContext>) -> *const c_void {
     use block2::StackBlock;
 
-    // Create the callback closure
+    // Create the callback closure - it owns the Arc clone
     let callback = move |status: i32, display_time: u64, surface: IOSurfaceRef, _update: CGDisplayStreamUpdateRef| {
         let status = unsafe { std::mem::transmute::<i32, CGDisplayStreamFrameStatus>(status) };
 
@@ -304,8 +306,8 @@ fn create_capture_block(context_ptr: *mut CaptureContext) -> *const c_void {
                     return;
                 }
 
-                let ctx = unsafe { &*context_ptr };
-                let frame_num = ctx.frame_count.fetch_add(1, Ordering::SeqCst);
+                // Access context through the Arc - safe because Arc keeps it alive
+                let frame_num = context.frame_count.fetch_add(1, Ordering::SeqCst);
 
                 // Lock the IOSurface to read pixel data
                 let lock_result = unsafe { IOSurfaceLock(surface, 1, std::ptr::null_mut()) }; // Read-only lock
@@ -344,7 +346,7 @@ fn create_capture_block(context_ptr: *mut CaptureContext) -> *const c_void {
                 };
 
                 // Send frame (non-blocking)
-                if let Err(e) = ctx.frame_tx.try_send(frame) {
+                if let Err(e) = context.frame_tx.try_send(frame) {
                     debug!("Frame dropped: {}", e);
                 }
             }
@@ -366,6 +368,7 @@ fn create_capture_block(context_ptr: *mut CaptureContext) -> *const c_void {
 
     // Leak the block so it lives for the duration of the stream
     // This is intentional - the block needs to stay alive until the stream is stopped
+    // The Arc inside ensures the context stays alive as long as the block does
     Box::into_raw(Box::new(block_copy)) as *const c_void
 }
 

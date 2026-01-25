@@ -6,7 +6,6 @@
 //! - CGEvent (for event creation and posting)
 
 use std::ffi::c_void;
-use std::ptr;
 
 // Core Foundation types
 pub type CFTypeRef = *const c_void;

@@ -11,7 +11,6 @@ mod sys;
 pub use capture::*;
 pub use inject::*;
 
-use bridge_common::{InputEvent, KeyboardEvent, MouseMoveEvent, MouseButtonEvent, MouseScrollEvent};
 
 /// Check if accessibility permission is granted (required for event capture)
 pub fn has_accessibility_permission() -> bool {

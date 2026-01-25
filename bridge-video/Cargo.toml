@@ -25,6 +25,7 @@ dispatch = { workspace = true }
 
 # Metal rendering
 metal = { workspace = true }
+core-graphics-types = "0.1.3"
 
 # For IOSurface and VideoToolbox bindings
 libc = "0.2"

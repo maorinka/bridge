@@ -6,10 +6,9 @@
 //! - Full-screen rendering
 
 use bridge_common::{BridgeResult, BridgeError};
-use std::ffi::c_void;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
-use metal::{Device, CommandQueue, MTLPixelFormat, RenderPipelineState};
+use metal::{Device, CommandQueue, MTLPixelFormat, RenderPipelineState, MetalLayer, MTLClearColor};
 
 use crate::codec::DecodedFrame;
 use crate::sys::*;
@@ -19,6 +18,8 @@ pub struct MetalDisplay {
     device: Device,
     command_queue: CommandQueue,
     pipeline_state: Option<RenderPipelineState>,
+    /// CAMetalLayer for presenting frames to screen
+    layer: Option<MetalLayer>,
     width: u32,
     height: u32,
     frame_count: u64,
@@ -40,6 +41,7 @@ impl MetalDisplay {
             device,
             command_queue,
             pipeline_state: None,
+            layer: None,
             width,
             height,
             frame_count: 0,
@@ -48,6 +50,37 @@ impl MetalDisplay {
         display.create_pipeline()?;
 
         Ok(display)
+    }
+
+    /// Set the Metal layer for rendering
+    ///
+    /// This should be called with a CAMetalLayer from a view before rendering.
+    /// The layer will be configured for optimal low-latency display.
+    pub fn set_layer(&mut self, layer: MetalLayer) {
+        // Configure layer for low latency
+        layer.set_device(&self.device);
+        layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+
+        // Set drawable size using core_graphics_types
+        let size = core_graphics_types::geometry::CGSize::new(
+            self.width as f64,
+            self.height as f64,
+        );
+        layer.set_drawable_size(size);
+
+        // Disable vsync for lowest latency (may cause tearing)
+        layer.set_display_sync_enabled(false);
+
+        // Use 2 drawables for double buffering
+        layer.set_maximum_drawable_count(2);
+
+        info!("Metal layer configured: {}x{}", self.width, self.height);
+        self.layer = Some(layer);
+    }
+
+    /// Check if a layer is set for rendering
+    pub fn has_layer(&self) -> bool {
+        self.layer.is_some()
     }
 
     fn create_pipeline(&mut self) -> BridgeResult<()> {
@@ -122,21 +155,54 @@ impl MetalDisplay {
 
     /// Render a decoded frame
     pub fn render(&mut self, frame: &DecodedFrame) -> BridgeResult<()> {
-        let _pipeline = self.pipeline_state.as_ref()
+        let pipeline = self.pipeline_state.as_ref()
             .ok_or_else(|| BridgeError::Video("Pipeline not created".into()))?;
 
         // Create texture from frame data
-        let _texture = self.create_texture_from_frame(frame)?;
+        let texture = self.create_texture_from_frame(frame)?;
 
-        // In a full implementation with a CAMetalLayer, we would:
-        // 1. Get next drawable from CAMetalLayer
-        // 2. Create a render pass with the drawable texture
-        // 3. Encode render commands (set pipeline, set texture, draw triangles)
-        // 4. Present the drawable
+        // If we have a layer, render to screen
+        if let Some(ref layer) = self.layer {
+            // Get next drawable from CAMetalLayer
+            let drawable = match layer.next_drawable() {
+                Some(d) => d,
+                None => {
+                    warn!("No drawable available, skipping frame");
+                    return Ok(());
+                }
+            };
+
+            // Create render pass descriptor
+            let render_pass_desc = metal::RenderPassDescriptor::new();
+            let color_attachment = render_pass_desc.color_attachments().object_at(0).unwrap();
+            color_attachment.set_texture(Some(drawable.texture()));
+            color_attachment.set_load_action(metal::MTLLoadAction::Clear);
+            color_attachment.set_clear_color(MTLClearColor::new(0.0, 0.0, 0.0, 1.0));
+            color_attachment.set_store_action(metal::MTLStoreAction::Store);
+
+            // Create command buffer and encoder
+            let command_buffer = self.command_queue.new_command_buffer();
+            let encoder = command_buffer.new_render_command_encoder(render_pass_desc);
+
+            // Set pipeline and texture
+            encoder.set_render_pipeline_state(pipeline);
+            encoder.set_fragment_texture(0, Some(&texture));
+
+            // Draw full-screen quad (6 vertices for 2 triangles)
+            encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
+
+            // End encoding and present
+            encoder.end_encoding();
+            command_buffer.present_drawable(drawable);
+            command_buffer.commit();
+
+            trace!("Rendered and presented frame {}", self.frame_count);
+        } else {
+            // No layer - just validate texture creation worked (useful for testing)
+            trace!("Rendered frame {} (no layer)", self.frame_count);
+        }
 
         self.frame_count += 1;
-        trace!("Rendered frame {}", self.frame_count);
-
         Ok(())
     }
 

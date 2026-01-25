@@ -15,7 +15,6 @@ pub use udp::*;
 pub use quic::*;
 pub use discovery::*;
 
-use bridge_common::{BridgeError, BridgeResult};
 use std::net::SocketAddr;
 
 /// Default ports for Bridge services
