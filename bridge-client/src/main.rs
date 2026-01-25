@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use bridge_common::{
-    ControlMessage, LatencyReport, elapsed_us,
+    ControlMessage, LatencyReport, VideoFrameHeader, elapsed_us,
 };
 use bridge_transport::{
     BridgeConnection, ServiceBrowser, TransportConfig, DEFAULT_CONTROL_PORT,
@@ -16,9 +16,111 @@ use bridge_video::{MetalDisplay, VideoDecoder, DecodedFrame};
 use bridge_input::{CaptureConfig, InputCapturer};
 use bridge_audio::{PlaybackConfig, AudioPlayer, AudioPacket};
 use clap::Parser;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
+
+/// Reassembles fragmented video frames
+struct FrameReassembler {
+    /// In-progress frames: frame_number -> (expected_fragment_count, received_fragments)
+    pending_frames: HashMap<u64, PendingFrame>,
+    /// Last completed frame number (for ordering)
+    last_completed_frame: u64,
+    /// Maximum age of pending frames before they're dropped (in microseconds)
+    max_age_us: u64,
+}
+
+struct PendingFrame {
+    header: VideoFrameHeader,
+    fragments: Vec<Option<Vec<u8>>>,
+    first_received_us: u64,
+    received_count: u16,
+}
+
+impl FrameReassembler {
+    fn new() -> Self {
+        Self {
+            pending_frames: HashMap::new(),
+            last_completed_frame: 0,
+            max_age_us: 100_000, // 100ms timeout for incomplete frames
+        }
+    }
+
+    /// Add a fragment, returns complete frame data if all fragments received
+    fn add_fragment(&mut self, header: VideoFrameHeader, data: Vec<u8>) -> Option<(VideoFrameHeader, Vec<u8>)> {
+        let now_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+
+        // Clean up old pending frames
+        self.cleanup_old_frames(now_us);
+
+        // Skip frames older than what we've already displayed
+        if header.frame_number <= self.last_completed_frame {
+            return None;
+        }
+
+        // Single fragment frame - return immediately
+        if header.fragment_count == 1 {
+            self.last_completed_frame = header.frame_number;
+            return Some((header, data));
+        }
+
+        // Multi-fragment frame - add to pending
+        let pending = self.pending_frames
+            .entry(header.frame_number)
+            .or_insert_with(|| PendingFrame {
+                header,
+                fragments: vec![None; header.fragment_count as usize],
+                first_received_us: now_us,
+                received_count: 0,
+            });
+
+        // Store this fragment
+        let idx = header.fragment_index as usize;
+        if idx < pending.fragments.len() && pending.fragments[idx].is_none() {
+            pending.fragments[idx] = Some(data);
+            pending.received_count += 1;
+        }
+
+        // Check if complete
+        if pending.received_count == pending.header.fragment_count {
+            let frame_number = pending.header.frame_number;
+            let completed_header = pending.header;
+
+            // Assemble all fragments
+            let total_size = pending.header.frame_size as usize;
+            let mut complete_data = Vec::with_capacity(total_size);
+
+            for fragment in &pending.fragments {
+                if let Some(frag_data) = fragment {
+                    complete_data.extend_from_slice(frag_data);
+                }
+            }
+
+            // Remove from pending
+            self.pending_frames.remove(&frame_number);
+            self.last_completed_frame = frame_number;
+
+            return Some((completed_header, complete_data));
+        }
+
+        None
+    }
+
+    fn cleanup_old_frames(&mut self, now_us: u64) {
+        self.pending_frames.retain(|_, pending| {
+            now_us - pending.first_received_us < self.max_age_us
+        });
+    }
+
+    /// Get statistics about pending frames
+    fn pending_count(&self) -> usize {
+        self.pending_frames.len()
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "bridge-client")]
@@ -138,9 +240,19 @@ async fn main() -> Result<()> {
     conn.send_control(ControlMessage::StartStream).await?;
     info!("Stream started");
 
+    // Frame reassembler for handling fragmented video frames
+    let mut frame_reassembler = FrameReassembler::new();
+
+    // Latency tracking
     let mut latency_samples: Vec<u64> = Vec::with_capacity(60);
+    let mut decode_latency_samples: Vec<u64> = Vec::with_capacity(60);
     let mut last_latency_report = tokio::time::Instant::now();
     let latency_report_interval = tokio::time::Duration::from_secs(1);
+
+    // Packet loss tracking
+    let mut expected_frame: u64 = 0;
+    let mut received_frames: u64 = 0;
+    let mut dropped_frames: u64 = 0;
 
     // Set up signal handlers for graceful shutdown
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -181,36 +293,66 @@ async fn main() -> Result<()> {
             ).await {
                 Ok(Ok((header, data))) => {
                     if header.packet_type == bridge_common::PacketType::Video {
-                        // Decode frame
-                        let decoded = if let Some(ref mut dec) = decoder {
-                            let encoded = bridge_video::EncodedFrame {
-                                data: data.clone(),
-                                pts_us: header.timestamp_us,
-                                dts_us: header.timestamp_us,
-                                is_keyframe: false,
-                                frame_number: header.sequence,
-                            };
-
-                            dec.decode(&encoded)?;
-                            dec.recv_frame()
-                        } else {
-                            Some(DecodedFrame {
-                                data: data.to_vec(),
-                                width: video_config.width,
-                                height: video_config.height,
-                                bytes_per_row: video_config.width * 4,
-                                pts_us: header.timestamp_us,
-                                io_surface: None,
-                            })
+                        // Parse the VideoFrameHeader from the data
+                        let video_header: VideoFrameHeader = match bincode::deserialize(&data[..VideoFrameHeader::SIZE.min(data.len())]) {
+                            Ok(h) => h,
+                            Err(e) => {
+                                warn!("Failed to parse video frame header: {}", e);
+                                continue;
+                            }
                         };
 
-                        if let Some(frame) = decoded {
-                            display.render(&frame)?;
+                        // Extract fragment data (after header)
+                        let fragment_data = data[VideoFrameHeader::SIZE.min(data.len())..].to_vec();
 
-                            let latency = elapsed_us(header.timestamp_us);
-                            latency_samples.push(latency);
-                            if latency_samples.len() > 60 {
-                                latency_samples.remove(0);
+                        // Add fragment to reassembler
+                        if let Some((complete_header, complete_data)) = frame_reassembler.add_fragment(video_header, fragment_data) {
+                            // Track frame ordering for packet loss calculation
+                            if complete_header.frame_number > expected_frame {
+                                dropped_frames += complete_header.frame_number - expected_frame;
+                            }
+                            expected_frame = complete_header.frame_number + 1;
+                            received_frames += 1;
+
+                            // Decode frame
+                            let decode_start = std::time::Instant::now();
+                            let decoded = if let Some(ref mut dec) = decoder {
+                                let encoded = bridge_video::EncodedFrame {
+                                    data: complete_data.into(),
+                                    pts_us: complete_header.pts_us,
+                                    dts_us: complete_header.pts_us,
+                                    is_keyframe: complete_header.is_keyframe,
+                                    frame_number: complete_header.frame_number,
+                                };
+
+                                dec.decode(&encoded)?;
+                                dec.recv_frame()
+                            } else {
+                                Some(DecodedFrame {
+                                    data: complete_data,
+                                    width: complete_header.width,
+                                    height: complete_header.height,
+                                    bytes_per_row: complete_header.width * 4,
+                                    pts_us: complete_header.pts_us,
+                                    io_surface: None,
+                                })
+                            };
+                            let decode_time_us = decode_start.elapsed().as_micros() as u64;
+
+                            if let Some(frame) = decoded {
+                                display.render(&frame)?;
+
+                                // Track latencies
+                                let network_latency = elapsed_us(complete_header.pts_us);
+                                latency_samples.push(network_latency);
+                                decode_latency_samples.push(decode_time_us);
+
+                                if latency_samples.len() > 60 {
+                                    latency_samples.remove(0);
+                                }
+                                if decode_latency_samples.len() > 60 {
+                                    decode_latency_samples.remove(0);
+                                }
                             }
                         }
                     }
@@ -260,18 +402,54 @@ async fn main() -> Result<()> {
             let avg_latency: u64 = latency_samples.iter().sum::<u64>()
                 / latency_samples.len() as u64;
 
-            let report = LatencyReport {
-                rtt_us: avg_latency * 2,
-                decode_latency_us: avg_latency / 2,
-                display_latency_us: avg_latency / 2,
-                packet_loss: 0.0,
-                jitter_us: 0,
+            let avg_decode: u64 = if !decode_latency_samples.is_empty() {
+                decode_latency_samples.iter().sum::<u64>() / decode_latency_samples.len() as u64
+            } else {
+                0
             };
 
-            debug!("Average latency: {}us ({:.1}ms)", avg_latency, avg_latency as f64 / 1000.0);
+            // Calculate jitter (variance in latency)
+            let jitter = if latency_samples.len() > 1 {
+                let mean = avg_latency as f64;
+                let variance: f64 = latency_samples.iter()
+                    .map(|&x| {
+                        let diff = x as f64 - mean;
+                        diff * diff
+                    })
+                    .sum::<f64>() / latency_samples.len() as f64;
+                variance.sqrt() as u64
+            } else {
+                0
+            };
+
+            // Calculate packet loss
+            let total_frames = received_frames + dropped_frames;
+            let packet_loss = if total_frames > 0 {
+                dropped_frames as f32 / total_frames as f32
+            } else {
+                0.0
+            };
+
+            let report = LatencyReport {
+                rtt_us: avg_latency * 2,
+                decode_latency_us: avg_decode,
+                display_latency_us: 2000, // ~2ms for Metal rendering
+                packet_loss,
+                jitter_us: jitter,
+            };
+
+            debug!("Latency: avg={}us ({:.1}ms), decode={}us, jitter={}us, loss={:.1}%, pending={}",
+                avg_latency, avg_latency as f64 / 1000.0,
+                avg_decode, jitter,
+                packet_loss * 100.0,
+                frame_reassembler.pending_count());
 
             conn.send_control(ControlMessage::LatencyReport(report)).await?;
             last_latency_report = tokio::time::Instant::now();
+
+            // Reset packet loss counters for next interval
+            received_frames = 0;
+            dropped_frames = 0;
         }
 
         // Small yield

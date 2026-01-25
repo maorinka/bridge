@@ -86,6 +86,16 @@ pub const K_CV_PIXEL_FORMAT_TYPE_420_YP_CB_CR_8_BI_PLANAR_VIDEO_RANGE: u32 = 0x3
 pub const K_VT_PROFILE_LEVEL_H264_HIGH_AUTO_LEVEL: CFStringRef = ptr::null();
 pub const K_VT_H264_ENTROPY_MODE_CABAC: CFStringRef = ptr::null();
 
+// VideoToolbox property keys (linked externally)
+#[link(name = "VideoToolbox", kind = "framework")]
+extern "C" {
+    pub static kVTCompressionPropertyKey_AverageBitRate: CFStringRef;
+    pub static kVTCompressionPropertyKey_ExpectedFrameRate: CFStringRef;
+    pub static kVTCompressionPropertyKey_RealTime: CFStringRef;
+    pub static kVTCompressionPropertyKey_AllowFrameReordering: CFStringRef;
+    pub static kVTCompressionPropertyKey_MaxKeyFrameInterval: CFStringRef;
+}
+
 // OSStatus codes
 pub const NO_ERR: OSStatus = 0;
 
@@ -354,6 +364,20 @@ pub const K_CM_VIDEO_CODEC_TYPE_HEVC: u32 = 0x68766331; // 'hvc1'
 
 // VideoToolbox property keys (these would normally be loaded from the framework)
 // For now we'll use dynamic lookup in the actual implementation
+
+/// CFNumber type constants
+pub const K_CF_NUMBER_SINT64_TYPE: i32 = 4; // kCFNumberSInt64Type
+
+/// Create a CFNumber from an i64 value
+pub fn cf_number_create_i64(value: i64) -> CFTypeRef {
+    unsafe {
+        CFNumberCreate(
+            kCFAllocatorDefault,
+            K_CF_NUMBER_SINT64_TYPE,
+            &value as *const i64 as *const c_void,
+        )
+    }
+}
 
 /// Safe wrapper for CFRelease
 pub fn cf_release(cf: CFTypeRef) {

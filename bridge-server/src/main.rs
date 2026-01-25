@@ -198,6 +198,16 @@ async fn handle_client(
     // Calculate fragment size based on MTU (leave room for headers)
     let fragment_size = max_packet_size - bridge_common::PacketHeader::SIZE - VideoFrameHeader::SIZE - 64;
 
+    // Adaptive bitrate control state
+    let initial_bitrate = video_config.bitrate;
+    let min_bitrate = 5_000_000u32;   // 5 Mbps minimum
+    let max_bitrate = 100_000_000u32; // 100 Mbps maximum
+    let target_latency_us = 16_000u64; // 16ms target for 60fps
+    let max_acceptable_latency_us = 33_000u64; // 33ms max before quality reduction
+    let mut current_bitrate = initial_bitrate;
+    let mut last_bitrate_adjustment = tokio::time::Instant::now();
+    let bitrate_adjustment_interval = tokio::time::Duration::from_secs(2);
+
     info!("Server components initialized");
 
     // Main server loop
@@ -228,8 +238,40 @@ async fn handle_client(
                                 info!("Client requested audio config: {:?}", cfg);
                             }
                             ControlMessage::LatencyReport(report) => {
-                                debug!("Latency report: RTT={}us, decode={}us",
-                                    report.rtt_us, report.decode_latency_us);
+                                debug!("Latency report: RTT={}us, decode={}us, loss={:.1}%, jitter={}us",
+                                    report.rtt_us, report.decode_latency_us,
+                                    report.packet_loss * 100.0, report.jitter_us);
+
+                                // Adaptive bitrate adjustment
+                                if let Some(ref mut enc) = encoder {
+                                    if last_bitrate_adjustment.elapsed() > bitrate_adjustment_interval {
+                                        let total_latency = report.rtt_us / 2 + report.decode_latency_us + report.display_latency_us;
+                                        let new_bitrate = if total_latency > max_acceptable_latency_us || report.packet_loss > 0.05 {
+                                            // Reduce bitrate by 20% if latency too high or packet loss > 5%
+                                            ((current_bitrate as f64) * 0.8) as u32
+                                        } else if total_latency < target_latency_us && report.packet_loss < 0.01 {
+                                            // Increase bitrate by 10% if latency is good and packet loss < 1%
+                                            ((current_bitrate as f64) * 1.1) as u32
+                                        } else {
+                                            current_bitrate
+                                        };
+
+                                        let new_bitrate = new_bitrate.clamp(min_bitrate, max_bitrate);
+                                        if new_bitrate != current_bitrate {
+                                            if let Err(e) = enc.set_bitrate(new_bitrate) {
+                                                warn!("Failed to adjust bitrate: {}", e);
+                                            } else {
+                                                info!("Bitrate adjusted: {} -> {} Mbps (latency: {}us, loss: {:.1}%)",
+                                                    current_bitrate / 1_000_000,
+                                                    new_bitrate / 1_000_000,
+                                                    total_latency,
+                                                    report.packet_loss * 100.0);
+                                                current_bitrate = new_bitrate;
+                                            }
+                                        }
+                                        last_bitrate_adjustment = tokio::time::Instant::now();
+                                    }
+                                }
                             }
                             ControlMessage::Disconnect => {
                                 info!("Client disconnecting");

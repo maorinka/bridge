@@ -308,6 +308,55 @@ impl VideoEncoder {
         }
         Ok(())
     }
+
+    /// Dynamically update the encoder bitrate
+    ///
+    /// This is used for adaptive bitrate control based on network conditions.
+    pub fn set_bitrate(&mut self, bitrate: u32) -> BridgeResult<()> {
+        if self.session.is_null() {
+            return Err(BridgeError::Video("Encoder not initialized".into()));
+        }
+
+        unsafe {
+            let bitrate_num = cf_number_create_i64(bitrate as i64);
+            if bitrate_num.is_null() {
+                return Err(BridgeError::Video("Failed to create bitrate CFNumber".into()));
+            }
+
+            let status = VTSessionSetProperty(
+                self.session as *mut c_void,
+                kVTCompressionPropertyKey_AverageBitRate,
+                bitrate_num,
+            );
+
+            CFRelease(bitrate_num);
+
+            if status != NO_ERR {
+                return Err(BridgeError::Video(format!(
+                    "Failed to set bitrate: {}",
+                    status
+                )));
+            }
+        }
+
+        info!("Encoder bitrate updated to {} bps ({:.1} Mbps)",
+            bitrate, bitrate as f64 / 1_000_000.0);
+        self.config.bitrate = bitrate;
+        Ok(())
+    }
+
+    /// Get current bitrate
+    pub fn bitrate(&self) -> u32 {
+        self.config.bitrate
+    }
+
+    /// Request a keyframe on next encode
+    pub fn request_keyframe(&mut self) {
+        // This is handled by setting frame properties during encode
+        // For now, we just log - the actual implementation would require
+        // tracking state and passing it to the next encode call
+        debug!("Keyframe requested");
+    }
 }
 
 impl Drop for VideoEncoder {
