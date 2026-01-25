@@ -1,0 +1,22 @@
+[package]
+name = "bridge-transport"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bridge-common = { path = "../bridge-common" }
+tokio = { workspace = true }
+bytes = { workspace = true }
+quinn = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+crossbeam-channel = { workspace = true }
+memmap2 = { workspace = true }
+
+# TLS for QUIC
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"

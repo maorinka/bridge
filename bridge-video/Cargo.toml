@@ -1,0 +1,33 @@
+[package]
+name = "bridge-video"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bridge-common = { path = "../bridge-common" }
+tokio = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+crossbeam-channel = { workspace = true }
+
+# macOS frameworks
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true }
+objc2-app-kit = { workspace = true }
+objc2-quartz-core = { workspace = true }
+block2 = { workspace = true }
+core-foundation = { workspace = true }
+core-graphics = { workspace = true }
+dispatch = { workspace = true }
+
+# Metal rendering
+metal = { workspace = true }
+
+# For IOSurface and VideoToolbox bindings
+libc = "0.2"
+
+[build-dependencies]
+cc = "1.2"

@@ -1,0 +1,29 @@
+[package]
+name = "bridge-input"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bridge-common = { path = "../bridge-common" }
+tokio = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+crossbeam-channel = { workspace = true }
+
+# macOS frameworks
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true }
+block2 = { workspace = true }
+core-foundation = { workspace = true }
+core-graphics = { workspace = true }
+dispatch = { workspace = true }
+
+# For IOKit/HID bindings
+libc = "0.2"
+
+[build-dependencies]
+cc = "1.2"

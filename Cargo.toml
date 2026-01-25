@@ -1,0 +1,71 @@
+[workspace]
+resolver = "2"
+members = [
+    "bridge-common",
+    "bridge-transport",
+    "bridge-video",
+    "bridge-input",
+    "bridge-audio",
+    "bridge-server",
+    "bridge-client",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Bridge Team"]
+license = "MIT"
+repository = "https://github.com/bridge-project/bridge"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.43", features = ["full"] }
+
+# Serialization
+bincode = "1.3"
+serde = { version = "1.0", features = ["derive"] }
+
+# Networking
+bytes = "1.9"
+quinn = "0.11"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# macOS specific
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
+objc2-quartz-core = "0.3"
+block2 = "0.6"
+core-foundation = "0.10"
+core-graphics = "0.24"
+dispatch = "0.2"
+
+# Metal rendering
+metal = "0.31"
+
+# Audio
+cpal = "0.15"
+
+# Zero-copy
+memmap2 = "0.9"
+
+# Utilities
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+once_cell = "1.20"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.dev]
+opt-level = 1

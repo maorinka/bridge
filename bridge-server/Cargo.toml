@@ -1,0 +1,35 @@
+[package]
+name = "bridge-server"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "bridge-server"
+path = "src/main.rs"
+
+[dependencies]
+bridge-common = { path = "../bridge-common" }
+bridge-transport = { path = "../bridge-transport" }
+bridge-video = { path = "../bridge-video" }
+bridge-input = { path = "../bridge-input" }
+bridge-audio = { path = "../bridge-audio" }
+
+tokio = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+parking_lot = { workspace = true }
+crossbeam-channel = { workspace = true }
+
+# macOS frameworks
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true }
+block2 = { workspace = true }
+core-foundation = { workspace = true }
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }

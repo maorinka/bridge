@@ -1,0 +1,10 @@
+[package]
+name = "bridge-common"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+bincode = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
