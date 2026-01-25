@@ -494,6 +494,7 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
             ).await {
                 Ok(Ok((header, data))) => {
                     if header.packet_type == bridge_common::PacketType::Video {
+                        debug!("Received video packet: {} bytes", data.len());
                         // Parse the VideoFrameHeader from the data
                         let video_header: VideoFrameHeader = match bincode::deserialize(&data[..VideoFrameHeader::SIZE.min(data.len())]) {
                             Ok(h) => h,
@@ -549,8 +550,14 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
                             };
                             let decode_time_us = decode_start.elapsed().as_micros() as u64;
 
+                            if decoded.is_none() {
+                                debug!("Decoder produced no output for frame {}", complete_header.frame_number);
+                            }
+
                             if let Some(frame) = decoded {
+                                debug!("Decoded frame: {}x{}, rendering...", frame.width, frame.height);
                                 display.render(&frame)?;
+                                debug!("Frame rendered successfully");
 
                                 // Track latencies
                                 let network_latency = elapsed_us(complete_header.pts_us);
