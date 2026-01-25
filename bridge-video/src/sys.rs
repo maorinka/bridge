@@ -168,6 +168,25 @@ extern "C" {
         format_description_out: *mut CMVideoFormatDescriptionRef,
     ) -> OSStatus;
 
+    // Extract parameter sets from format descriptions
+    pub fn CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+        video_desc: CMVideoFormatDescriptionRef,
+        parameter_set_index: usize,
+        parameter_set_pointer_out: *mut *const u8,
+        parameter_set_size_out: *mut usize,
+        parameter_set_count_out: *mut usize,
+        nal_unit_header_length_out: *mut i32,
+    ) -> OSStatus;
+
+    pub fn CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+        video_desc: CMVideoFormatDescriptionRef,
+        parameter_set_index: usize,
+        parameter_set_pointer_out: *mut *const u8,
+        parameter_set_size_out: *mut usize,
+        parameter_set_count_out: *mut usize,
+        nal_unit_header_length_out: *mut i32,
+    ) -> OSStatus;
+
     // Sample buffer creation for decoding
     pub fn CMSampleBufferCreate(
         allocator: CFAllocatorRef,

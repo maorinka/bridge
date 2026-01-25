@@ -216,7 +216,8 @@ pub struct VideoFrameHeader {
 }
 
 impl VideoFrameHeader {
-    pub const SIZE: usize = 40;
+    // Bincode serialized size: u64(8) + u64(8) + bool(1) + u32(4) + u16(2) + u16(2) + u32(4) + u32(4) = 33
+    pub const SIZE: usize = 33;
 }
 
 // ============================================================================

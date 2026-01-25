@@ -102,6 +102,7 @@ impl From<&VideoConfig> for EncoderConfig {
 struct EncoderCallbackContext {
     frame_tx: Sender<EncodedFrame>,
     frame_count: Arc<AtomicU64>,
+    codec: VideoCodec,
 }
 
 /// Hardware video encoder using VideoToolbox
@@ -147,6 +148,7 @@ impl VideoEncoder {
         let callback_ctx = Box::new(EncoderCallbackContext {
             frame_tx,
             frame_count: frame_count.clone(),
+            codec: config.codec,
         });
 
         let callback_ctx_ptr = &*callback_ctx as *const EncoderCallbackContext as *mut c_void;
@@ -415,12 +417,43 @@ extern "C" fn encoder_output_callback(
         let data = std::slice::from_raw_parts(data_ptr, total_length);
         let frame_num = ctx.frame_count.fetch_add(1, Ordering::SeqCst);
 
-        // Check if keyframe by looking for IDR NAL unit (simplified check)
-        // In AVCC format, we'd check sample attachments
-        let is_keyframe = frame_num == 0 || (data.len() > 4 && (data[4] & 0x1F) == 5);
+        // Check if keyframe - first frame is always keyframe
+        // For H.265 we check for IDR NAL type (19 or 20), for H.264 it's NAL type 5
+        let is_keyframe = if frame_num == 0 {
+            true
+        } else if data.len() > 5 {
+            match ctx.codec {
+                VideoCodec::H265 => {
+                    // H.265: NAL type is bits 1-6 of first byte after 4-byte length prefix
+                    let nal_type = (data[4] >> 1) & 0x3F;
+                    // IDR_W_RADL (19), IDR_N_LP (20), CRA (21)
+                    nal_type >= 19 && nal_type <= 21
+                }
+                VideoCodec::H264 => {
+                    // H.264: NAL type is bits 0-4 of first byte after 4-byte length prefix
+                    let nal_type = data[4] & 0x1F;
+                    nal_type == 5 // IDR
+                }
+                VideoCodec::Raw => false,
+            }
+        } else {
+            false
+        };
+
+        // For keyframes, prepend parameter sets from the format description
+        let final_data = if is_keyframe {
+            let format_desc = CMSampleBufferGetFormatDescription(sample_buffer);
+            if !format_desc.is_null() {
+                extract_and_prepend_parameter_sets(format_desc, data, ctx.codec)
+            } else {
+                data.to_vec()
+            }
+        } else {
+            data.to_vec()
+        };
 
         let frame = EncodedFrame {
-            data: Bytes::copy_from_slice(data),
+            data: Bytes::from(final_data),
             pts_us: pts.microseconds(),
             dts_us: pts.microseconds(),
             is_keyframe,
@@ -431,6 +464,75 @@ extern "C" fn encoder_output_callback(
             debug!("Encoded frame dropped: {}", e);
         }
     }
+}
+
+/// Extract parameter sets from format description and prepend to frame data
+unsafe fn extract_and_prepend_parameter_sets(
+    format_desc: CMFormatDescriptionRef,
+    data: &[u8],
+    codec: VideoCodec,
+) -> Vec<u8> {
+    let mut result = Vec::with_capacity(data.len() + 256);
+
+    match codec {
+        VideoCodec::H265 => {
+            // For H.265, we need VPS, SPS, PPS (indices 0, 1, 2)
+            for idx in 0..3 {
+                let mut param_ptr: *const u8 = ptr::null();
+                let mut param_size: usize = 0;
+                let mut _count: usize = 0;
+                let mut _nal_length: i32 = 0;
+
+                let status = CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+                    format_desc,
+                    idx,
+                    &mut param_ptr,
+                    &mut param_size,
+                    &mut _count,
+                    &mut _nal_length,
+                );
+
+                if status == NO_ERR && !param_ptr.is_null() && param_size > 0 {
+                    let param_data = std::slice::from_raw_parts(param_ptr, param_size);
+                    // Write 4-byte AVCC length prefix
+                    result.extend_from_slice(&(param_size as u32).to_be_bytes());
+                    result.extend_from_slice(param_data);
+                    debug!("Prepended H.265 param set {} ({} bytes)", idx, param_size);
+                }
+            }
+        }
+        VideoCodec::H264 => {
+            // For H.264, we need SPS, PPS (indices 0, 1)
+            for idx in 0..2 {
+                let mut param_ptr: *const u8 = ptr::null();
+                let mut param_size: usize = 0;
+                let mut _count: usize = 0;
+                let mut _nal_length: i32 = 0;
+
+                let status = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                    format_desc,
+                    idx,
+                    &mut param_ptr,
+                    &mut param_size,
+                    &mut _count,
+                    &mut _nal_length,
+                );
+
+                if status == NO_ERR && !param_ptr.is_null() && param_size > 0 {
+                    let param_data = std::slice::from_raw_parts(param_ptr, param_size);
+                    // Write 4-byte AVCC length prefix
+                    result.extend_from_slice(&(param_size as u32).to_be_bytes());
+                    result.extend_from_slice(param_data);
+                    debug!("Prepended H.264 param set {} ({} bytes)", idx, param_size);
+                }
+            }
+        }
+        VideoCodec::Raw => {}
+    }
+
+    // Append original frame data
+    result.extend_from_slice(data);
+    result
 }
 
 /// Context for decoder output callback
@@ -903,7 +1005,9 @@ impl VideoDecoder {
                     debug!("Found H.265 PPS ({} bytes)", nal.len());
                     pps = Some(nal.to_vec());
                 }
-                _ => {}
+                _ => {
+                    debug!("Found H.265 NAL type {} ({} bytes)", nal_type, nal.len());
+                }
             }
 
             // Stop once we have all three
