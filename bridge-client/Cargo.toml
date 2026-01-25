@@ -29,8 +29,10 @@ crossbeam-channel = { workspace = true }
 objc2 = { workspace = true }
 objc2-foundation = { workspace = true }
 objc2-app-kit = { workspace = true }
+objc2-quartz-core = { workspace = true }
 block2 = { workspace = true }
 core-foundation = { workspace = true }
+core-graphics-types = "0.1"
 
 # Metal rendering
 metal = { workspace = true }

@@ -232,6 +232,65 @@ async fn handle_client(
 
     info!("Server components initialized");
 
+    // Wait for UDP ping packets from client to learn their address
+    info!("Waiting for client UDP pings...");
+
+    // Wait for video channel ping
+    if let Some(video_ch) = conn.video_channel() {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            video_ch.recv()
+        ).await {
+            Ok(Ok((header, _))) => {
+                debug!("Received video channel ping from client (type: {:?})", header.packet_type);
+            }
+            Ok(Err(e)) => {
+                warn!("Error receiving video ping: {}", e);
+            }
+            Err(_) => {
+                warn!("Timeout waiting for video channel ping");
+            }
+        }
+    }
+
+    // Wait for audio channel ping
+    if let Some(audio_ch) = conn.audio_channel() {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            audio_ch.recv()
+        ).await {
+            Ok(Ok((header, _))) => {
+                debug!("Received audio channel ping from client (type: {:?})", header.packet_type);
+            }
+            Ok(Err(e)) => {
+                warn!("Error receiving audio ping: {}", e);
+            }
+            Err(_) => {
+                warn!("Timeout waiting for audio channel ping");
+            }
+        }
+    }
+
+    // Wait for input channel ping (client -> server)
+    if let Some(input_ch) = conn.input_channel() {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            input_ch.recv()
+        ).await {
+            Ok(Ok((header, _))) => {
+                debug!("Received input channel ping from client (type: {:?})", header.packet_type);
+            }
+            Ok(Err(e)) => {
+                warn!("Error receiving input ping: {}", e);
+            }
+            Err(_) => {
+                warn!("Timeout waiting for input channel ping");
+            }
+        }
+    }
+
+    info!("UDP channels initialized with client addresses");
+
     // Main server loop
     loop {
         // Handle control messages

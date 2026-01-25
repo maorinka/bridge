@@ -18,8 +18,22 @@ use bridge_audio::{PlaybackConfig, AudioPlayer, AudioPacket};
 use clap::Parser;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use parking_lot::Mutex;
 use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
+
+// macOS imports for window creation
+use objc2::rc::Retained;
+use objc2::{ClassType, MainThreadOnly};
+use objc2_foundation::{MainThreadMarker, NSString, NSPoint, NSSize, NSRect};
+use objc2_app_kit::{
+    NSApplication, NSApplicationActivationPolicy, NSWindow, NSWindowStyleMask,
+    NSBackingStoreType, NSView,
+};
+use objc2_quartz_core::CAMetalLayer;
+use metal::foreign_types::ForeignType;
+use metal::MetalLayer;
 
 /// Reassembles fragmented video frames
 struct FrameReassembler {
@@ -147,8 +161,93 @@ struct Args {
     windowed: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Create an NSWindow with a CAMetalLayer for video display
+fn create_window(mtm: MainThreadMarker, width: u32, height: u32, fullscreen: bool) -> (Retained<NSWindow>, MetalLayer) {
+    // Get screen frame for fullscreen
+    let screen_frame = if fullscreen {
+        unsafe {
+            if let Some(screen) = NSScreen::mainScreen(mtm) {
+                screen.frame()
+            } else {
+                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width as f64, height as f64))
+            }
+        }
+    } else {
+        NSRect::new(NSPoint::new(100.0, 100.0), NSSize::new(width as f64, height as f64))
+    };
+
+    // Create window
+    let style = if fullscreen {
+        NSWindowStyleMask::Borderless
+    } else {
+        NSWindowStyleMask::Titled
+            | NSWindowStyleMask::Closable
+            | NSWindowStyleMask::Resizable
+            | NSWindowStyleMask::Miniaturizable
+    };
+
+    let window = unsafe {
+        NSWindow::initWithContentRect_styleMask_backing_defer(
+            NSWindow::alloc(mtm),
+            screen_frame,
+            style,
+            NSBackingStoreType::Buffered,
+            false,
+        )
+    };
+
+    // Set window properties
+    unsafe {
+        let title = NSString::from_str("Bridge");
+        window.setTitle(&title);
+        window.setAcceptsMouseMovedEvents(true);
+
+        if fullscreen {
+            window.setLevel(1000); // Above other windows
+            window.setCollectionBehavior(
+                objc2_app_kit::NSWindowCollectionBehavior::FullScreenPrimary
+            );
+        }
+    }
+
+    // Create a content view with layer backing
+    let content_view = unsafe {
+        let view = NSView::initWithFrame(NSView::alloc(mtm), screen_frame);
+        view.setWantsLayer(true);
+        view
+    };
+
+    // Create CAMetalLayer
+    let ca_layer = unsafe { CAMetalLayer::new() };
+
+    // Wrap in metal-rs MetalLayer
+    let metal_layer = unsafe {
+        MetalLayer::from_ptr(Retained::into_raw(ca_layer) as *mut _)
+    };
+
+    // Set the layer on the view
+    unsafe {
+        // Get the raw CAMetalLayer pointer from MetalLayer
+        let layer_ptr = metal_layer.as_ptr();
+        let layer: &CAMetalLayer = &*(layer_ptr as *const CAMetalLayer);
+        content_view.setLayer(Some(layer));
+
+        window.setContentView(Some(&content_view));
+    }
+
+    // Show window
+    unsafe {
+        window.makeKeyAndOrderFront(None);
+        window.center();
+    }
+
+    (window, metal_layer)
+}
+
+// Import NSScreen
+use objc2_app_kit::NSScreen;
+
+fn main() -> Result<()> {
     let args = Args::parse();
 
     // Initialize logging
@@ -173,6 +272,28 @@ async fn main() -> Result<()> {
         warn!("Enable in System Preferences > Security & Privacy > Privacy > Accessibility");
     }
 
+    // Get main thread marker - required for macOS GUI operations
+    let mtm = MainThreadMarker::new().expect("Must run on main thread");
+
+    // Initialize NSApplication
+    let app = NSApplication::sharedApplication(mtm);
+    unsafe {
+        app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+        app.activateIgnoringOtherApps(true);
+    }
+
+    // Build and run the tokio runtime for async operations
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    // Run the async main logic
+    let result = runtime.block_on(async_main(args, mtm));
+
+    result
+}
+
+async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
     // Determine server address
     let server_addr = if let Some(server) = args.server {
         server.parse::<SocketAddr>()
@@ -233,8 +354,15 @@ async fn main() -> Result<()> {
     let video_config = welcome.video_config;
     let audio_config = welcome.audio_config;
 
-    // Initialize components
+    // Create window with Metal layer
+    let fullscreen = !args.windowed;
+    let (window, metal_layer) = create_window(mtm, video_config.width, video_config.height, fullscreen);
+    info!("Window created: {}x{}, fullscreen={}", video_config.width, video_config.height, fullscreen);
+
+    // Initialize display and set the layer
     let mut display = MetalDisplay::new(video_config.width, video_config.height)?;
+    display.set_layer(metal_layer);
+    info!("Metal display initialized with layer");
 
     let mut decoder = if video_config.codec != bridge_common::VideoCodec::Raw {
         Some(VideoDecoder::new(
@@ -263,6 +391,20 @@ async fn main() -> Result<()> {
     };
 
     info!("Client components initialized");
+
+    // Send ping packets on UDP channels so server learns our address
+    info!("Sending UDP channel pings...");
+    if let Some(video_ch) = conn.video_channel() {
+        let _ = video_ch.send(bridge_common::PacketType::Video, b"ping").await;
+    }
+    if let Some(audio_ch) = conn.audio_channel() {
+        let _ = audio_ch.send(bridge_common::PacketType::Audio, b"ping").await;
+    }
+    if let Some(input_ch) = conn.input_channel() {
+        let _ = input_ch.send(bridge_common::PacketType::Input, b"ping").await;
+    }
+    // Give server time to receive pings
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Request stream start
     conn.send_control(ControlMessage::StartStream).await?;
