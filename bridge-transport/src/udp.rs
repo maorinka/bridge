@@ -134,16 +134,25 @@ impl UdpChannel {
     pub async fn recv(&mut self) -> BridgeResult<(PacketHeader, Bytes)> {
         let mut buf = vec![0u8; self.max_packet_size];
 
-        debug!("Waiting to receive on {:?}", self.socket.local_addr());
-        let (len, from) = self.socket.recv_from(&mut buf).await.map_err(|e| {
-            BridgeError::Transport(format!("Receive failed: {}", e))
-        })?;
-        debug!("Received {} bytes from {} on {:?}", len, from, self.socket.local_addr());
+        let len = if self.is_connected {
+            // Connected socket - use recv() not recv_from()
+            // recv_from() on connected socket may have issues on macOS
+            self.socket.recv(&mut buf).await.map_err(|e| {
+                BridgeError::Transport(format!("Receive failed: {}", e))
+            })?
+        } else {
+            debug!("Waiting to receive on {:?}", self.socket.local_addr());
+            let (len, from) = self.socket.recv_from(&mut buf).await.map_err(|e| {
+                BridgeError::Transport(format!("Receive failed: {}", e))
+            })?;
+            debug!("Received {} bytes from {} on {:?}", len, from, self.socket.local_addr());
 
-        // Update remote address if not set
-        if self.remote_addr.is_none() {
-            self.remote_addr = Some(from);
-        }
+            // Update remote address if not set
+            if self.remote_addr.is_none() {
+                self.remote_addr = Some(from);
+            }
+            len
+        };
 
         if len < PacketHeader::SIZE {
             return Err(BridgeError::Protocol("Packet too small".into()));
