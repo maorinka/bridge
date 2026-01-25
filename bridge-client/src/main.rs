@@ -190,11 +190,39 @@ async fn main() -> Result<()> {
 
     info!("Connecting to server at {}", server_addr);
 
+    // Detect local display resolution to request from server
+    let displays = bridge_video::get_displays();
+    let main_display = displays.iter().find(|d| d.is_main).or_else(|| displays.first());
+    let (display_width, display_height) = match main_display {
+        Some(d) => {
+            info!("Detected display: {}x{}", d.width, d.height);
+            (d.width, d.height)
+        }
+        None => {
+            warn!("Could not detect display, using 1920x1080");
+            (1920, 1080)
+        }
+    };
+
+    // Create video config with client's display resolution
+    let requested_video_config = bridge_common::VideoConfig {
+        width: display_width,
+        height: display_height,
+        fps: 60,
+        codec: bridge_common::VideoCodec::H265,
+        bitrate: 50_000_000,
+        pixel_format: bridge_common::PixelFormat::Bgra8,
+    };
+
     // Connect to server
     let transport_config = TransportConfig::default();
     let mut conn = BridgeConnection::new(server_addr, transport_config);
 
-    let welcome = conn.connect(&args.name).await?;
+    let welcome = conn.connect_with_config(
+        &args.name,
+        requested_video_config,
+        bridge_common::AudioConfig::default(),
+    ).await?;
     info!("Connected to server: {}", welcome.server_name);
     info!("  Video: {}x{} @ {}fps",
         welcome.video_config.width,

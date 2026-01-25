@@ -262,7 +262,18 @@ impl ScreenCapturer {
 
     /// Get the next captured frame
     pub fn recv_frame(&self) -> Option<CapturedFrame> {
-        self.frame_rx.try_recv().ok()
+        match self.frame_rx.try_recv() {
+            Ok(frame) => {
+                debug!("recv_frame: got frame {} ({}x{})",
+                       frame.frame_number, frame.width, frame.height);
+                Some(frame)
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => None,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                warn!("recv_frame: channel disconnected");
+                None
+            }
+        }
     }
 
     /// Get the next captured frame (blocking)
@@ -298,13 +309,20 @@ fn create_capture_block(context: Arc<CaptureContext>) -> *const c_void {
 
     // Create the callback closure - it owns the Arc clone
     let callback = move |status: i32, display_time: u64, surface: IOSurfaceRef, _update: CGDisplayStreamUpdateRef| {
+        // Debug: log every callback invocation
+        debug!("CGDisplayStream callback: status={}, display_time={}, surface_null={}",
+               status, display_time, surface.is_null());
+
         // Safety: CGDisplayStreamFrameStatus values match the i32 values from CGDisplayStream
         let status = match status {
             0 => CGDisplayStreamFrameStatus::FrameComplete,
             1 => CGDisplayStreamFrameStatus::FrameIdle,
             2 => CGDisplayStreamFrameStatus::FrameBlank,
             3 => CGDisplayStreamFrameStatus::Stopped,
-            _ => return, // Unknown status, ignore
+            _ => {
+                warn!("Unknown CGDisplayStream status: {}", status);
+                return;
+            }
         };
 
         match status {
@@ -353,8 +371,14 @@ fn create_capture_block(context: Arc<CaptureContext>) -> *const c_void {
                 };
 
                 // Send frame (non-blocking)
-                if let Err(e) = context.frame_tx.try_send(frame) {
-                    debug!("Frame dropped: {}", e);
+                match context.frame_tx.try_send(frame) {
+                    Ok(()) => {
+                        debug!("Frame {} sent to channel ({}x{}, {} bytes)",
+                               frame_num, width, height, data_size);
+                    }
+                    Err(e) => {
+                        warn!("Frame {} dropped: {}", frame_num, e);
+                    }
                 }
             }
             CGDisplayStreamFrameStatus::FrameIdle => {

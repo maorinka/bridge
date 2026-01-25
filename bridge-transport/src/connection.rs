@@ -56,6 +56,16 @@ impl BridgeConnection {
 
     /// Connect to the remote server (client mode)
     pub async fn connect(&mut self, client_name: &str) -> BridgeResult<WelcomeMessage> {
+        self.connect_with_config(client_name, VideoConfig::default(), AudioConfig::default()).await
+    }
+
+    /// Connect to the remote server with specific video/audio configuration (client mode)
+    pub async fn connect_with_config(
+        &mut self,
+        client_name: &str,
+        video_config: VideoConfig,
+        audio_config: AudioConfig,
+    ) -> BridgeResult<WelcomeMessage> {
         info!("Connecting to {}", self.remote_addr);
         *self.state.write().await = ConnectionState::Connecting;
 
@@ -69,8 +79,8 @@ impl BridgeConnection {
         let hello = HelloMessage {
             client_name: client_name.to_string(),
             protocol_version: bridge_common::PROTOCOL_VERSION,
-            video_config: VideoConfig::default(),
-            audio_config: AudioConfig::default(),
+            video_config,
+            audio_config,
         };
 
         control.send_control(ControlMessage::Hello(hello)).await?;

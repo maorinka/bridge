@@ -52,6 +52,10 @@ struct Args {
     #[arg(long)]
     raw_video: bool,
 
+    /// Disable audio capture
+    #[arg(long)]
+    no_audio: bool,
+
     /// Verbose logging
     #[arg(short, long)]
     verbose: bool,
@@ -128,6 +132,7 @@ async fn main() -> Result<()> {
                         let transport_config = transport_config.clone();
                         let video_config = video_config.clone();
                         let audio_config = audio_config.clone();
+                        let no_audio = args.no_audio;
 
                         tokio::spawn(async move {
                             if let Err(e) = handle_client(
@@ -136,6 +141,7 @@ async fn main() -> Result<()> {
                                 transport_config,
                                 video_config,
                                 audio_config,
+                                no_audio,
                             ).await {
                                 error!("Client session error: {}", e);
                             }
@@ -167,6 +173,7 @@ async fn handle_client(
     config: TransportConfig,
     video_config: VideoConfig,
     audio_config: AudioConfig,
+    no_audio: bool,
 ) -> Result<()> {
     info!("Client connected from {}", control_conn.remote_addr());
 
@@ -175,6 +182,10 @@ async fn handle_client(
     let (mut conn, hello) = BridgeConnection::accept(control_conn, config, server_name).await?;
 
     info!("Handshake complete with client: {}", hello.client_name);
+
+    // Use the client's requested video configuration
+    let video_config = hello.video_config;
+    info!("Client requested: {}x{} @ {}fps", video_config.width, video_config.height, video_config.fps);
 
     // Initialize components
     let capture_config = CaptureConfig::from(&video_config);
@@ -187,8 +198,19 @@ async fn handle_client(
         None
     };
 
-    let audio_capture_config = AudioCaptureConfig::from(&audio_config);
-    let mut audio_capturer = AudioCapturer::new(audio_capture_config)?;
+    let mut audio_capturer: Option<AudioCapturer> = if no_audio {
+        info!("Audio capture disabled");
+        None
+    } else {
+        let audio_capture_config = AudioCaptureConfig::from(&audio_config);
+        match AudioCapturer::new(audio_capture_config) {
+            Ok(capturer) => Some(capturer),
+            Err(e) => {
+                warn!("Audio capture unavailable: {}. Continuing without audio.", e);
+                None
+            }
+        }
+    };
 
     let mut input_injector = InputInjector::new()?;
 
@@ -221,13 +243,17 @@ async fn handle_client(
                             ControlMessage::StartStream => {
                                 info!("Client requested stream start");
                                 capturer.start().await?;
-                                audio_capturer.start()?;
+                                if let Some(ref mut ac) = audio_capturer {
+                                    ac.start()?;
+                                }
                                 is_streaming = true;
                             }
                             ControlMessage::StopStream => {
                                 info!("Client requested stream stop");
                                 capturer.stop()?;
-                                audio_capturer.stop()?;
+                                if let Some(ref mut ac) = audio_capturer {
+                                    ac.stop()?;
+                                }
                                 is_streaming = false;
                             }
                             ControlMessage::ConfigureVideo(cfg) => {
@@ -289,13 +315,18 @@ async fn handle_client(
 
             _ = tokio::time::sleep(std::time::Duration::from_millis(1)), if is_streaming => {
                 // Process video frames
+                let mut frames_this_tick = 0u32;
                 while let Some(frame) = capturer.recv_frame() {
+                    frames_this_tick += 1;
                     if let Some(ref mut enc) = encoder {
+                        debug!("Encoding frame {} ({}x{}, {} bytes)",
+                               frame.frame_number, frame.width, frame.height, frame.data.len());
                         if let Err(e) = enc.encode(&frame) {
                             warn!("Encode error: {}", e);
                         }
 
                         while let Some(encoded) = enc.recv_frame() {
+                            debug!("Encoded frame: {} bytes, keyframe={}", encoded.data.len(), encoded.is_keyframe);
                             if let Some(video_ch) = conn.video_channel() {
                                 // Send with proper VideoFrameHeader and fragmentation
                                 let data = &encoded.data;
@@ -337,13 +368,19 @@ async fn handle_client(
                     }
                 }
 
+                if frames_this_tick > 0 {
+                    debug!("Processed {} frames this tick", frames_this_tick);
+                }
+
                 // Process audio packets
-                while let Some(packet) = audio_capturer.recv_packet() {
-                    if let Some(audio_ch) = conn.audio_channel() {
-                        let _ = audio_ch.send(
-                            bridge_common::PacketType::Audio,
-                            &packet.data,
-                        ).await;
+                if let Some(ref mut ac) = audio_capturer {
+                    while let Some(packet) = ac.recv_packet() {
+                        if let Some(audio_ch) = conn.audio_channel() {
+                            let _ = audio_ch.send(
+                                bridge_common::PacketType::Audio,
+                                &packet.data,
+                            ).await;
+                        }
                     }
                 }
             }
@@ -368,7 +405,9 @@ async fn handle_client(
 
     // Clean up
     capturer.stop()?;
-    audio_capturer.stop()?;
+    if let Some(ref mut ac) = audio_capturer {
+        ac.stop()?;
+    }
     conn.disconnect().await?;
 
     info!("Client session ended");
