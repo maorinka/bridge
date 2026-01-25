@@ -201,8 +201,7 @@ impl Drop for VirtualDisplay {
 
 /// Check if virtual display creation is supported
 pub fn is_virtual_display_supported() -> bool {
-    unsafe {
-        let class = objc_getClass(b"CGVirtualDisplay\0".as_ptr() as *const i8);
-        !class.is_null()
-    }
+    // Disabled for now - objc_msgSend calls crash on Apple Silicon
+    // TODO: Fix using proper objc2 bindings
+    false
 }
