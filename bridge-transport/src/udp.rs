@@ -5,7 +5,7 @@ use bytes::{Bytes, BytesMut};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 /// UDP channel for low-latency data transfer
 pub struct UdpChannel {
@@ -14,6 +14,8 @@ pub struct UdpChannel {
     max_packet_size: usize,
     send_sequence: u64,
     recv_buffer: BytesMut,
+    /// True if socket.connect() was called (client mode)
+    is_connected: bool,
 }
 
 impl UdpChannel {
@@ -35,6 +37,7 @@ impl UdpChannel {
             max_packet_size,
             send_sequence: 0,
             recv_buffer: BytesMut::with_capacity(max_packet_size),
+            is_connected: false,
         })
     }
 
@@ -59,6 +62,7 @@ impl UdpChannel {
             max_packet_size,
             send_sequence: 0,
             recv_buffer: BytesMut::with_capacity(max_packet_size),
+            is_connected: true,
         })
     }
 
@@ -94,10 +98,17 @@ impl UdpChannel {
         packet.extend_from_slice(&header_bytes);
         packet.extend_from_slice(data);
 
-        let sent = if let Some(addr) = self.remote_addr {
+        let sent = if self.is_connected {
+            // Socket was connected via connect() - use send() not send_to()
+            // On macOS, send_to() on a connected socket fails with "Socket is already connected"
+            debug!("Sending {} bytes via connected socket", packet.len());
+            self.socket.send(&packet).await
+        } else if let Some(addr) = self.remote_addr {
+            debug!("Sending {} bytes from {:?} to {}", packet.len(), self.socket.local_addr(), addr);
             self.socket.send_to(&packet, addr).await
         } else {
-            self.socket.send(&packet).await
+            warn!("No remote_addr set, cannot send packet");
+            return Err(BridgeError::Transport("No remote address set".into()));
         }.map_err(|e| BridgeError::Transport(format!("Send failed: {}", e)))?;
 
         trace!("Sent {} bytes (seq: {})", sent, self.send_sequence - 1);
@@ -107,10 +118,13 @@ impl UdpChannel {
 
     /// Send raw data without header (for fragmented frames)
     pub async fn send_raw(&self, data: &[u8]) -> BridgeResult<usize> {
-        let sent = if let Some(addr) = self.remote_addr {
+        let sent = if self.is_connected {
+            // Socket was connected via connect() - use send()
+            self.socket.send(data).await
+        } else if let Some(addr) = self.remote_addr {
             self.socket.send_to(data, addr).await
         } else {
-            self.socket.send(data).await
+            return Err(BridgeError::Transport("No remote address set".into()));
         }.map_err(|e| BridgeError::Transport(format!("Send failed: {}", e)))?;
 
         Ok(sent)
@@ -120,9 +134,11 @@ impl UdpChannel {
     pub async fn recv(&mut self) -> BridgeResult<(PacketHeader, Bytes)> {
         let mut buf = vec![0u8; self.max_packet_size];
 
+        debug!("Waiting to receive on {:?}", self.socket.local_addr());
         let (len, from) = self.socket.recv_from(&mut buf).await.map_err(|e| {
             BridgeError::Transport(format!("Receive failed: {}", e))
         })?;
+        debug!("Received {} bytes from {} on {:?}", len, from, self.socket.local_addr());
 
         // Update remote address if not set
         if self.remote_addr.is_none() {

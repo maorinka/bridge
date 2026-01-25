@@ -101,6 +101,8 @@ pub enum ControlMessage {
     StopStream,
     /// Latency report for adaptive quality
     LatencyReport(LatencyReport),
+    /// Request a keyframe (decoder sync)
+    RequestKeyframe,
     /// Disconnect gracefully
     Disconnect,
 }

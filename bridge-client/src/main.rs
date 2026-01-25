@@ -57,7 +57,7 @@ impl FrameReassembler {
         Self {
             pending_frames: HashMap::new(),
             last_completed_frame: 0,
-            max_age_us: 100_000, // 100ms timeout for incomplete frames
+            max_age_us: 500_000, // 500ms timeout for incomplete frames (keyframes can be large)
         }
     }
 
@@ -72,7 +72,8 @@ impl FrameReassembler {
         self.cleanup_old_frames(now_us);
 
         // Skip frames older than what we've already displayed
-        if header.frame_number <= self.last_completed_frame {
+        // Note: use < not <= because frame 0 is valid when last_completed_frame starts at 0
+        if header.frame_number < self.last_completed_frame {
             return None;
         }
 
@@ -97,12 +98,25 @@ impl FrameReassembler {
         if idx < pending.fragments.len() && pending.fragments[idx].is_none() {
             pending.fragments[idx] = Some(data);
             pending.received_count += 1;
+
+            // Fragment 0 carries the is_keyframe flag - update it when we receive it
+            // This handles out-of-order UDP packet delivery
+            if header.fragment_index == 0 {
+                if header.is_keyframe {
+                    debug!("Received keyframe fragment 0 for frame {} ({} fragments total)",
+                           header.frame_number, header.fragment_count);
+                    pending.header.is_keyframe = true;
+                }
+            }
         }
 
         // Check if complete
         if pending.received_count == pending.header.fragment_count {
             let frame_number = pending.header.frame_number;
             let completed_header = pending.header;
+            debug!("Frame {} complete ({} fragments, {} bytes, keyframe={})",
+                   frame_number, completed_header.fragment_count,
+                   completed_header.frame_size, completed_header.is_keyframe);
 
             // Assemble all fragments
             let total_size = pending.header.frame_size as usize;
@@ -354,6 +368,31 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
     let video_config = welcome.video_config;
     let audio_config = welcome.audio_config;
 
+    // Send ping packets on UDP channels so server learns our address
+    // Retry multiple times to handle race condition where server may not be ready yet
+    info!("Sending UDP channel pings...");
+    for attempt in 0..10 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        if let Some(video_ch) = conn.video_channel() {
+            if let Err(e) = video_ch.send(bridge_common::PacketType::Video, b"ping").await {
+                error!("Failed to send video ping: {}", e);
+            }
+        }
+        if let Some(audio_ch) = conn.audio_channel() {
+            if let Err(e) = audio_ch.send(bridge_common::PacketType::Audio, b"ping").await {
+                error!("Failed to send audio ping: {}", e);
+            }
+        }
+        if let Some(input_ch) = conn.input_channel() {
+            if let Err(e) = input_ch.send(bridge_common::PacketType::Input, b"ping").await {
+                error!("Failed to send input ping: {}", e);
+            }
+        }
+    }
+    debug!("UDP pings sent (10 attempts over 900ms)");
+
     // Create window with Metal layer
     let fullscreen = !args.windowed;
     let (window, metal_layer) = create_window(mtm, video_config.width, video_config.height, fullscreen);
@@ -392,23 +431,15 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
 
     info!("Client components initialized");
 
-    // Send ping packets on UDP channels so server learns our address
-    info!("Sending UDP channel pings...");
-    if let Some(video_ch) = conn.video_channel() {
-        let _ = video_ch.send(bridge_common::PacketType::Video, b"ping").await;
-    }
-    if let Some(audio_ch) = conn.audio_channel() {
-        let _ = audio_ch.send(bridge_common::PacketType::Audio, b"ping").await;
-    }
-    if let Some(input_ch) = conn.input_channel() {
-        let _ = input_ch.send(bridge_common::PacketType::Input, b"ping").await;
-    }
-    // Give server time to receive pings
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
     // Request stream start
     conn.send_control(ControlMessage::StartStream).await?;
     info!("Stream started");
+
+    // Request a keyframe now that we're ready to receive
+    // This handles the case where the first keyframe was sent before we were ready
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    conn.send_control(ControlMessage::RequestKeyframe).await?;
+    debug!("Keyframe requested");
 
     // Frame reassembler for handling fragmented video frames
     let mut frame_reassembler = FrameReassembler::new();
@@ -472,11 +503,20 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
                             }
                         };
 
+                        // Log fragment details for debugging
+                        if video_header.is_keyframe || video_header.fragment_count > 10 {
+                            debug!("Received fragment {}/{} for frame {} (keyframe={})",
+                                   video_header.fragment_index, video_header.fragment_count,
+                                   video_header.frame_number, video_header.is_keyframe);
+                        }
+
                         // Extract fragment data (after header)
                         let fragment_data = data[VideoFrameHeader::SIZE.min(data.len())..].to_vec();
 
                         // Add fragment to reassembler
                         if let Some((complete_header, complete_data)) = frame_reassembler.add_fragment(video_header, fragment_data) {
+                            debug!("Frame {} complete ({} bytes, keyframe={})",
+                                  complete_header.frame_number, complete_data.len(), complete_header.is_keyframe);
                             // Track frame ordering for packet loss calculation
                             if complete_header.frame_number > expected_frame {
                                 dropped_frames += complete_header.frame_number - expected_frame;

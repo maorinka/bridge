@@ -595,14 +595,19 @@ impl VideoDecoder {
     pub fn decode(&mut self, frame: &EncodedFrame) -> BridgeResult<()> {
         // If not initialized and this is a keyframe, try to extract parameter sets
         if !self.initialized && frame.is_keyframe {
+            debug!("Received keyframe ({} bytes), attempting to extract parameter sets", frame.data.len());
             if let Some((sps, pps, vps)) = Self::extract_parameter_sets(&frame.data, self.codec) {
+                debug!("Extracted SPS ({} bytes), PPS ({} bytes), VPS: {}",
+                       sps.len(), pps.len(), vps.as_ref().map(|v| v.len()).unwrap_or(0));
                 self.initialize_session(&sps, &pps, vps.as_deref())?;
+            } else {
+                debug!("Failed to extract parameter sets from keyframe");
             }
         }
 
         if !self.initialized || self.session.is_null() {
             // Wait for keyframe with parameter sets
-            debug!("Decoder not initialized, waiting for keyframe");
+            debug!("Decoder not initialized, waiting for keyframe (frame.is_keyframe={})", frame.is_keyframe);
             return Ok(());
         }
 
@@ -711,11 +716,13 @@ impl VideoDecoder {
         }
 
         // Try to detect format and extract NAL units
+        debug!("Attempting to parse NAL units from {} bytes", data.len());
         let nal_units = Self::parse_nal_units(data);
         if nal_units.is_empty() {
-            debug!("No NAL units found in data");
+            debug!("No NAL units found in data (first 16 bytes: {:02x?})", &data[..data.len().min(16)]);
             return None;
         }
+        debug!("Found {} NAL units", nal_units.len());
 
         match codec {
             VideoCodec::H264 => Self::extract_h264_params(&nal_units),

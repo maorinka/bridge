@@ -139,6 +139,8 @@ impl BridgeConnection {
         let audio_config = hello.audio_config.clone();
 
         // Set up UDP channels
+        // The server binds to these ports. Client will connect and send packets.
+        // We'll learn the client's source address on first recv.
         let video_channel = UdpChannel::bind(config.video_port, config.max_packet_size).await?;
         let audio_channel = UdpChannel::bind(config.audio_port, config.max_packet_size).await?;
         let input_channel = UdpChannel::bind(config.input_port, config.max_packet_size).await?;

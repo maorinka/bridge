@@ -233,63 +233,90 @@ async fn handle_client(
     info!("Server components initialized");
 
     // Wait for UDP ping packets from client to learn their address
+    // Wait for client UDP pings using tokio polling
     info!("Waiting for client UDP pings...");
 
-    // Wait for video channel ping
+    // Poll for video ping with timeout
     if let Some(video_ch) = conn.video_channel() {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            video_ch.recv()
-        ).await {
-            Ok(Ok((header, _))) => {
-                debug!("Received video channel ping from client (type: {:?})", header.packet_type);
-            }
-            Ok(Err(e)) => {
-                warn!("Error receiving video ping: {}", e);
-            }
-            Err(_) => {
-                warn!("Timeout waiting for video channel ping");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                video_ch.recv()
+            ).await {
+                Ok(Ok((header, _))) => {
+                    debug!("Received video ping from client (type: {:?})", header.packet_type);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    warn!("Error receiving video ping: {}", e);
+                    break;
+                }
+                Err(_) => {
+                    // Timeout - check if we've exceeded the deadline
+                    if tokio::time::Instant::now() > deadline {
+                        warn!("Timeout waiting for video ping");
+                        break;
+                    }
+                    // Otherwise keep polling
+                }
             }
         }
     }
 
-    // Wait for audio channel ping
+    // Poll for audio ping
     if let Some(audio_ch) = conn.audio_channel() {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            audio_ch.recv()
-        ).await {
-            Ok(Ok((header, _))) => {
-                debug!("Received audio channel ping from client (type: {:?})", header.packet_type);
-            }
-            Ok(Err(e)) => {
-                warn!("Error receiving audio ping: {}", e);
-            }
-            Err(_) => {
-                warn!("Timeout waiting for audio channel ping");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                audio_ch.recv()
+            ).await {
+                Ok(Ok((header, _))) => {
+                    debug!("Received audio ping from client (type: {:?})", header.packet_type);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    warn!("Error receiving audio ping: {}", e);
+                    break;
+                }
+                Err(_) => {
+                    if tokio::time::Instant::now() > deadline {
+                        warn!("Timeout waiting for audio ping");
+                        break;
+                    }
+                }
             }
         }
     }
 
-    // Wait for input channel ping (client -> server)
+    // Poll for input ping
     if let Some(input_ch) = conn.input_channel() {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            input_ch.recv()
-        ).await {
-            Ok(Ok((header, _))) => {
-                debug!("Received input channel ping from client (type: {:?})", header.packet_type);
-            }
-            Ok(Err(e)) => {
-                warn!("Error receiving input ping: {}", e);
-            }
-            Err(_) => {
-                warn!("Timeout waiting for input channel ping");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                input_ch.recv()
+            ).await {
+                Ok(Ok((header, _))) => {
+                    debug!("Received input ping from client (type: {:?})", header.packet_type);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    warn!("Error receiving input ping: {}", e);
+                    break;
+                }
+                Err(_) => {
+                    if tokio::time::Instant::now() > deadline {
+                        warn!("Timeout waiting for input ping");
+                        break;
+                    }
+                }
             }
         }
     }
 
-    info!("UDP channels initialized with client addresses");
+    info!("UDP channels initialized");
 
     // Main server loop
     loop {
@@ -362,6 +389,12 @@ async fn handle_client(
                                 info!("Client disconnecting");
                                 break;
                             }
+                            ControlMessage::RequestKeyframe => {
+                                info!("Client requested keyframe");
+                                if let Some(ref mut enc) = encoder {
+                                    enc.request_keyframe();
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -415,10 +448,12 @@ async fn handle_client(
                                     packet.extend_from_slice(&header_bytes);
                                     packet.extend_from_slice(chunk);
 
-                                    let _ = video_ch.send(
+                                    if let Err(e) = video_ch.send(
                                         bridge_common::PacketType::Video,
                                         &packet,
-                                    ).await;
+                                    ).await {
+                                        warn!("Failed to send video fragment: {}", e);
+                                    }
                                 }
 
                                 video_frame_number += 1;
