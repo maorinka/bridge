@@ -171,63 +171,102 @@ async fn handle_client(
     control_conn: bridge_transport::QuicConnection,
     server_name: &str,
     config: TransportConfig,
-    video_config: VideoConfig,
+    _video_config: VideoConfig,
     audio_config: AudioConfig,
     no_audio: bool,
 ) -> Result<()> {
     info!("Client connected from {}", control_conn.remote_addr());
 
-    // Accept the connection and perform handshake
+    // Get server's native display resolution BEFORE accepting
+    let displays = get_displays();
+    let main_display = displays.iter().find(|d| d.is_main).or(displays.first());
+    let (native_width, native_height) = main_display
+        .map(|d| (d.width, d.height))
+        .unwrap_or((1920, 1080));
+
+    info!("Server native display: {}x{}", native_width, native_height);
+
+    // Accept with config negotiation - create virtual display if client needs higher res
     let max_packet_size = config.max_packet_size;
-    let (mut conn, hello) = BridgeConnection::accept(control_conn, config, server_name).await?;
+
+    // We'll store the virtual display here to keep it alive during the session
+    let mut _virtual_display: Option<VirtualDisplay> = None;
+
+    let (mut conn, hello) = BridgeConnection::accept_with_negotiation(
+        control_conn,
+        config,
+        server_name,
+        |hello| {
+            // Client's requested resolution
+            hello.video_config.clone()
+        }
+    ).await?;
 
     info!("Handshake complete with client: {}", hello.client_name);
 
-    // Use the client's requested video configuration
-    let video_config = hello.video_config;
-    info!("Client requested: {}x{} @ {}fps", video_config.width, video_config.height, video_config.fps);
+    // Get the negotiated video config (client's request)
+    let video_config = conn.video_config().cloned().unwrap();
 
-    // Check if we need a virtual display for the client's resolution
-    let displays = get_displays();
-    let main_display = displays.iter().find(|d| d.is_main).or(displays.first());
-    let server_resolution = main_display.map(|d| (d.width, d.height)).unwrap_or((1920, 1080));
+    // Check if we need to create a virtual display for higher resolution
+    let capture_width;
+    let capture_height;
+    let mut capture_display_id: Option<u32> = None;
 
-    info!("Server native display: {}x{}", server_resolution.0, server_resolution.1);
+    if video_config.width > native_width || video_config.height > native_height {
+        info!("Client requested {}x{}, higher than native {}x{}",
+              video_config.width, video_config.height, native_width, native_height);
 
-    // Create virtual display if client wants higher resolution than server has
-    let virtual_display = if video_config.width > server_resolution.0 || video_config.height > server_resolution.1 {
         if is_virtual_display_supported() {
-            info!("Creating virtual display at {}x{} for client", video_config.width, video_config.height);
             match VirtualDisplay::new(video_config.width, video_config.height, video_config.fps) {
                 Ok(vd) => {
-                    info!("Virtual display created: ID={}", vd.display_id());
-                    Some(vd)
+                    info!("Created virtual display at {}x{} (ID={})",
+                          vd.width(), vd.height(), vd.display_id());
+                    capture_width = vd.width();
+                    capture_height = vd.height();
+                    capture_display_id = Some(vd.display_id());
+                    _virtual_display = Some(vd);
                 }
                 Err(e) => {
                     warn!("Failed to create virtual display: {}. Using native resolution.", e);
-                    None
+                    capture_width = native_width;
+                    capture_height = native_height;
                 }
             }
         } else {
-            warn!("Virtual display not supported on this macOS version. Using native resolution.");
-            None
+            warn!("Virtual display not supported (requires macOS 14+). Using native resolution.");
+            capture_width = native_width;
+            capture_height = native_height;
         }
     } else {
-        None
-    };
-
-    // Initialize capture - use virtual display if available
-    let mut capture_config = CaptureConfig::from(&video_config);
-    if let Some(ref vd) = virtual_display {
-        capture_config.display_id = Some(vd.display_id());
-        capture_config.width = vd.width();
-        capture_config.height = vd.height();
+        capture_width = native_width;
+        capture_height = native_height;
     }
 
+    info!("Capture resolution: {}x{} @ {}fps", capture_width, capture_height, video_config.fps);
+
+    // Create capture config with actual capture resolution
+    let mut capture_config = CaptureConfig {
+        width: capture_width,
+        height: capture_height,
+        fps: video_config.fps,
+        show_cursor: true,
+        capture_audio: false,
+        display_id: capture_display_id,
+    };
+
+    // Create video config for encoder
+    let capture_video_config = VideoConfig {
+        width: capture_width,
+        height: capture_height,
+        fps: video_config.fps,
+        codec: video_config.codec,
+        bitrate: video_config.bitrate,
+        pixel_format: video_config.pixel_format,
+    };
     let mut capturer = ScreenCapturer::new(capture_config)?;
 
-    let mut encoder = if video_config.codec != bridge_common::VideoCodec::Raw {
-        let encoder_config = EncoderConfig::from(&video_config);
+    let mut encoder = if capture_video_config.codec != bridge_common::VideoCodec::Raw {
+        let encoder_config = EncoderConfig::from(&capture_video_config);
         Some(VideoEncoder::new(encoder_config)?)
     } else {
         None

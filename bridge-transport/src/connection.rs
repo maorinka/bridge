@@ -115,11 +115,26 @@ impl BridgeConnection {
     }
 
     /// Accept a connection from a client (server mode)
+    /// Uses the client's requested video config
     pub async fn accept(
         control: QuicConnection,
         config: TransportConfig,
         server_name: &str,
     ) -> BridgeResult<(Self, HelloMessage)> {
+        Self::accept_with_negotiation(control, config, server_name, |hello| hello.video_config.clone()).await
+    }
+
+    /// Accept a connection with config negotiation
+    /// The negotiate_config function receives the client's hello and returns the actual video config to use
+    pub async fn accept_with_negotiation<F>(
+        control: QuicConnection,
+        config: TransportConfig,
+        server_name: &str,
+        negotiate_config: F,
+    ) -> BridgeResult<(Self, HelloMessage)>
+    where
+        F: FnOnce(&HelloMessage) -> VideoConfig,
+    {
         let mut control = control;
         let remote_addr = control.remote_addr();
 
@@ -134,18 +149,18 @@ impl BridgeConnection {
 
         info!("Client connecting: {}", hello.client_name);
 
-        // Negotiate configuration
-        let video_config = hello.video_config.clone(); // Accept client's request for now
+        // Let caller negotiate the actual video config
+        let video_config = negotiate_config(&hello);
         let audio_config = hello.audio_config.clone();
 
+        info!("Negotiated video config: {}x{} @ {}fps", video_config.width, video_config.height, video_config.fps);
+
         // Set up UDP channels
-        // The server binds to these ports. Client will connect and send packets.
-        // We'll learn the client's source address on first recv.
         let video_channel = UdpChannel::bind(config.video_port, config.max_packet_size).await?;
         let audio_channel = UdpChannel::bind(config.audio_port, config.max_packet_size).await?;
         let input_channel = UdpChannel::bind(config.input_port, config.max_packet_size).await?;
 
-        // Send Welcome response
+        // Send Welcome response with actual config server will use
         let welcome = WelcomeMessage {
             server_name: server_name.to_string(),
             video_config: video_config.clone(),
