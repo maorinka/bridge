@@ -132,7 +132,10 @@ impl Drop for VirtualDisplay {
 
 /// Check if virtual display creation is supported
 pub fn is_virtual_display_supported() -> bool {
-    // Disabled - API methods differ from documentation
-    // TODO: Research correct CGVirtualDisplay API
-    false
+    // Check if CGVirtualDisplay class exists (macOS 14+)
+    let class_exists = objc2::runtime::AnyClass::get(c"CGVirtualDisplay").is_some();
+    if !class_exists {
+        warn!("CGVirtualDisplay not available - requires macOS 14+");
+    }
+    class_exists
 }
