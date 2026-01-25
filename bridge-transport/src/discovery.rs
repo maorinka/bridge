@@ -246,6 +246,7 @@ impl Drop for ServiceAdvertiser {
 struct BrowserContext {
     servers: Arc<RwLock<HashMap<String, ServerInfo>>>,
     event_tx: mpsc::Sender<DiscoveryEvent>,
+    runtime_handle: tokio::runtime::Handle,
 }
 
 /// Context for resolve callback
@@ -253,6 +254,7 @@ struct ResolveContext {
     name: String,
     servers: Arc<RwLock<HashMap<String, ServerInfo>>>,
     event_tx: mpsc::Sender<DiscoveryEvent>,
+    runtime_handle: tokio::runtime::Handle,
 }
 
 /// Service browser for clients
@@ -298,6 +300,7 @@ extern "C" fn browse_callback(
             name: name_str,
             servers: ctx.servers.clone(),
             event_tx: ctx.event_tx.clone(),
+            runtime_handle: ctx.runtime_handle.clone(),
         });
 
         let resolve_ctx_ptr = Box::into_raw(resolve_ctx) as *mut c_void;
@@ -331,8 +334,9 @@ extern "C" fn browse_callback(
         debug!("Service removed: {}", name_str);
         let servers = ctx.servers.clone();
         let event_tx = ctx.event_tx.clone();
+        let handle = ctx.runtime_handle.clone();
 
-        tokio::spawn(async move {
+        handle.spawn(async move {
             servers.write().await.remove(&name_str);
             let _ = event_tx.send(DiscoveryEvent::ServerLost(name_str)).await;
         });
@@ -367,8 +371,9 @@ extern "C" fn resolve_callback(
     let servers = ctx.servers.clone();
     let event_tx = ctx.event_tx.clone();
     let name = ctx.name.clone();
+    let handle = ctx.runtime_handle.clone();
 
-    tokio::spawn(async move {
+    handle.spawn(async move {
         match resolve_hostname(&host_str).await {
             Ok(ip) => {
                 let addr = SocketAddr::new(ip, port_host);
@@ -401,6 +406,7 @@ impl ServiceBrowser {
         let context = Box::new(BrowserContext {
             servers: servers.clone(),
             event_tx: event_tx.clone(),
+            runtime_handle: tokio::runtime::Handle::current(),
         });
 
         let context_ptr = Box::into_raw(context);
@@ -494,16 +500,51 @@ impl Drop for ServiceBrowser {
 /// Resolve a hostname to an IP address
 pub async fn resolve_hostname(hostname: &str) -> BridgeResult<IpAddr> {
     use tokio::net::lookup_host;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     let addr = format!("{}:0", hostname);
-    let mut addrs = lookup_host(&addr).await.map_err(|e| {
+    let addrs: Vec<_> = lookup_host(&addr).await.map_err(|e| {
         BridgeError::Transport(format!("Failed to resolve hostname '{}': {}", hostname, e))
-    })?;
+    })?.collect();
 
-    addrs
-        .next()
-        .map(|a| a.ip())
-        .ok_or_else(|| BridgeError::Transport(format!("No addresses found for '{}'", hostname)))
+    if addrs.is_empty() {
+        return Err(BridgeError::Transport(format!("No addresses found for '{}'", hostname)));
+    }
+
+    // Prefer addresses in this order:
+    // 1. IPv4 addresses (most compatible)
+    // 2. Global IPv6 addresses
+    // 3. Link-local addresses (last resort, may not work across interfaces)
+
+    // First try to find an IPv4 address
+    for addr in &addrs {
+        if let IpAddr::V4(v4) = addr.ip() {
+            if !v4.is_loopback() && !v4.is_unspecified() {
+                debug!("Resolved {} to IPv4 {}", hostname, v4);
+                return Ok(IpAddr::V4(v4));
+            }
+        }
+    }
+
+    // Then try global IPv6 addresses
+    for addr in &addrs {
+        if let IpAddr::V6(v6) = addr.ip() {
+            // Skip link-local (fe80::) and loopback addresses
+            let segments = v6.segments();
+            let is_link_local = segments[0] == 0xfe80;
+            let is_loopback = v6.is_loopback();
+
+            if !is_link_local && !is_loopback {
+                debug!("Resolved {} to IPv6 {}", hostname, v6);
+                return Ok(IpAddr::V6(v6));
+            }
+        }
+    }
+
+    // Fall back to first address if nothing better found
+    let fallback = addrs[0].ip();
+    debug!("Resolved {} to fallback address {}", hostname, fallback);
+    Ok(fallback)
 }
 
 /// Get all local IP addresses
