@@ -298,7 +298,14 @@ fn create_capture_block(context: Arc<CaptureContext>) -> *const c_void {
 
     // Create the callback closure - it owns the Arc clone
     let callback = move |status: i32, display_time: u64, surface: IOSurfaceRef, _update: CGDisplayStreamUpdateRef| {
-        let status = unsafe { std::mem::transmute::<i32, CGDisplayStreamFrameStatus>(status) };
+        // Safety: CGDisplayStreamFrameStatus values match the i32 values from CGDisplayStream
+        let status = match status {
+            0 => CGDisplayStreamFrameStatus::FrameComplete,
+            1 => CGDisplayStreamFrameStatus::FrameIdle,
+            2 => CGDisplayStreamFrameStatus::FrameBlank,
+            3 => CGDisplayStreamFrameStatus::Stopped,
+            _ => return, // Unknown status, ignore
+        };
 
         match status {
             CGDisplayStreamFrameStatus::FrameComplete => {
@@ -366,10 +373,15 @@ fn create_capture_block(context: Arc<CaptureContext>) -> *const c_void {
     let block = StackBlock::new(callback);
     let block_copy = block.copy();
 
-    // Leak the block so it lives for the duration of the stream
-    // This is intentional - the block needs to stay alive until the stream is stopped
+    // Get the raw block pointer - RcBlock derefs to the underlying Block type
+    // which has the correct Objective-C block ABI layout
+    let block_ptr = (&*block_copy) as *const _ as *const c_void;
+
+    // Leak the RcBlock so the block stays alive for the duration of the stream
     // The Arc inside ensures the context stays alive as long as the block does
-    Box::into_raw(Box::new(block_copy)) as *const c_void
+    std::mem::forget(block_copy);
+
+    block_ptr
 }
 
 /// Capture statistics
