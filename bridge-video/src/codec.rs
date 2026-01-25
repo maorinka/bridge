@@ -418,26 +418,45 @@ extern "C" fn encoder_output_callback(
         let frame_num = ctx.frame_count.fetch_add(1, Ordering::SeqCst);
 
         // Check if keyframe - first frame is always keyframe
-        // For H.265 we check for IDR NAL type (19 or 20), for H.264 it's NAL type 5
+        // For subsequent frames, scan NAL units for IDR types
         let is_keyframe = if frame_num == 0 {
             true
-        } else if data.len() > 5 {
-            match ctx.codec {
-                VideoCodec::H265 => {
-                    // H.265: NAL type is bits 1-6 of first byte after 4-byte length prefix
-                    let nal_type = (data[4] >> 1) & 0x3F;
-                    // IDR_W_RADL (19), IDR_N_LP (20), CRA (21)
-                    nal_type >= 19 && nal_type <= 21
-                }
-                VideoCodec::H264 => {
-                    // H.264: NAL type is bits 0-4 of first byte after 4-byte length prefix
-                    let nal_type = data[4] & 0x1F;
-                    nal_type == 5 // IDR
-                }
-                VideoCodec::Raw => false,
-            }
         } else {
-            false
+            // Scan all NAL units in AVCC format for IDR NAL types
+            let mut found_keyframe = false;
+            let mut offset = 0;
+            while offset + 4 < data.len() {
+                let nal_len = u32::from_be_bytes([
+                    data[offset], data[offset + 1], data[offset + 2], data[offset + 3]
+                ]) as usize;
+
+                if nal_len == 0 || nal_len > data.len() - offset - 4 {
+                    break;
+                }
+
+                if offset + 4 < data.len() {
+                    let nal_type = match ctx.codec {
+                        VideoCodec::H265 => (data[offset + 4] >> 1) & 0x3F,
+                        VideoCodec::H264 => data[offset + 4] & 0x1F,
+                        VideoCodec::Raw => 0,
+                    };
+
+                    let is_idr = match ctx.codec {
+                        VideoCodec::H265 => nal_type >= 19 && nal_type <= 21, // IDR_W_RADL, IDR_N_LP, CRA
+                        VideoCodec::H264 => nal_type == 5, // IDR
+                        VideoCodec::Raw => false,
+                    };
+
+                    if is_idr {
+                        found_keyframe = true;
+                        debug!("Found IDR NAL type {} at offset {}", nal_type, offset);
+                        break;
+                    }
+                }
+
+                offset += 4 + nal_len;
+            }
+            found_keyframe
         };
 
         // For keyframes, prepend parameter sets from the format description
@@ -713,13 +732,25 @@ impl VideoDecoder {
             return Ok(());
         }
 
+        // For keyframes, strip parameter sets and only decode the slice data
+        let decode_data = if frame.is_keyframe {
+            Self::strip_parameter_sets(&frame.data, self.codec)
+        } else {
+            frame.data.to_vec()
+        };
+
+        if decode_data.is_empty() {
+            debug!("No slice data to decode after stripping parameter sets");
+            return Ok(());
+        }
+
         unsafe {
             // Create block buffer from encoded data
             // Use CMBlockBufferCreateWithMemoryBlock with kCFAllocatorNull for the memory block
             // and then copy the data into the buffer using CMBlockBufferReplaceDataBytes
             let mut block_buffer: CMBlockBufferRef = ptr::null_mut();
 
-            let data_len = frame.data.len();
+            let data_len = decode_data.len();
 
             // Create an empty block buffer that will allocate and own its memory
             let status = CMBlockBufferCreateWithMemoryBlock(
@@ -743,7 +774,7 @@ impl VideoDecoder {
 
             // Copy data into the block buffer - the buffer owns this memory
             let copy_status = CMBlockBufferReplaceDataBytes(
-                frame.data.as_ptr() as *const c_void,
+                decode_data.as_ptr() as *const c_void,
                 block_buffer,
                 0,
                 data_len,
@@ -786,10 +817,10 @@ impl VideoDecoder {
             CFRelease(block_buffer as CFTypeRef);
 
             if status != NO_ERR || sample_buffer.is_null() {
-                return Err(BridgeError::Video(format!(
-                    "Failed to create sample buffer: {}",
-                    status
-                )));
+                warn!("Failed to create sample buffer: {} (frame {}, {} bytes)",
+                      status, frame.frame_number, data_len);
+                // Don't fail completely, just skip this frame
+                return Ok(());
             }
 
             // Decode the frame
@@ -801,8 +832,11 @@ impl VideoDecoder {
                 ptr::null_mut(),
             );
 
+            // Release sample buffer after decode
+            CFRelease(sample_buffer as CFTypeRef);
+
             if decode_status != NO_ERR {
-                warn!("Decode failed with status: {}", decode_status);
+                warn!("Decode failed with status: {} (frame {})", decode_status, frame.frame_number);
             }
         }
 
@@ -831,6 +865,58 @@ impl VideoDecoder {
             VideoCodec::H265 => Self::extract_h265_params(&nal_units),
             VideoCodec::Raw => None,
         }
+    }
+
+    /// Strip parameter sets (VPS, SPS, PPS) from frame data, keeping only slice NAL units
+    fn strip_parameter_sets(data: &[u8], codec: VideoCodec) -> Vec<u8> {
+        let mut result = Vec::new();
+        let mut offset = 0;
+
+        while offset + 4 < data.len() {
+            let length = u32::from_be_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]) as usize;
+
+            if length == 0 || length > data.len() - offset - 4 {
+                break;
+            }
+
+            let nal_start = offset + 4;
+            let nal_end = nal_start + length;
+
+            if nal_end <= data.len() && length > 0 {
+                let nal_data = &data[nal_start..nal_end];
+                let is_param_set = match codec {
+                    VideoCodec::H265 => {
+                        let nal_type = (nal_data[0] >> 1) & 0x3F;
+                        // VPS (32), SPS (33), PPS (34), SEI prefix (39), SEI suffix (40)
+                        matches!(nal_type, 32 | 33 | 34 | 39 | 40)
+                    }
+                    VideoCodec::H264 => {
+                        let nal_type = nal_data[0] & 0x1F;
+                        // SPS (7), PPS (8), SEI (6)
+                        matches!(nal_type, 6 | 7 | 8)
+                    }
+                    VideoCodec::Raw => false,
+                };
+
+                if !is_param_set {
+                    // Keep this NAL unit - write length prefix and data
+                    result.extend_from_slice(&data[offset..nal_end]);
+                    debug!("Keeping NAL unit at offset {} (type for decode, {} bytes)", offset, length);
+                } else {
+                    debug!("Stripping parameter set NAL at offset {} ({} bytes)", offset, length);
+                }
+            }
+
+            offset = nal_end;
+        }
+
+        debug!("Stripped parameter sets: {} bytes -> {} bytes", data.len(), result.len());
+        result
     }
 
     /// Parse NAL units from data (supports AVCC 4-byte length prefix and Annex B start codes)
