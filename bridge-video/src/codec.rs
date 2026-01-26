@@ -218,8 +218,8 @@ impl VideoEncoder {
                 info!("  Frame rate: {} fps", config.fps);
             }
 
-            // Set max keyframe interval (every 2 seconds for recovery)
-            let keyframe_interval = (config.fps * 2) as i64;
+            // Set max keyframe interval (every 0.5 seconds for fast recovery on lossy connections)
+            let keyframe_interval = (config.fps / 2) as i64;
             let keyframe_num = cf_number_create_i64(keyframe_interval);
             let status = VTSessionSetProperty(
                 encoder.session as *mut c_void,
