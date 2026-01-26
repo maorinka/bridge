@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use bridge_common::{
-    ControlMessage, LatencyReport, VideoFrameHeader, elapsed_us,
+    ControlMessage, LatencyReport, VideoFrameHeader,
 };
 use bridge_transport::{
     BridgeConnection, ServiceBrowser, TransportConfig, DEFAULT_CONTROL_PORT,
@@ -217,7 +217,6 @@ fn create_window(mtm: MainThreadMarker, width: u32, height: u32, fullscreen: boo
         window.setAcceptsMouseMovedEvents(true);
 
         if fullscreen {
-            window.setLevel(1000); // Above other windows
             window.setCollectionBehavior(
                 objc2_app_kit::NSWindowCollectionBehavior::FullScreenPrimary
             );
@@ -345,7 +344,7 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
         height: display_height,
         fps: 60,
         codec: bridge_common::VideoCodec::H265,
-        bitrate: 50_000_000,
+        bitrate: 15_000_000, // 15 Mbps - smaller keyframes for WiFi reliability
         pixel_format: bridge_common::PixelFormat::Bgra8,
     };
 
@@ -393,25 +392,22 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
     }
     debug!("UDP pings sent (10 attempts over 900ms)");
 
-    // Create window with Metal layer
+    // Create window with Metal layer - use native resolution for now
+    // The actual frame size may differ from requested
     let fullscreen = !args.windowed;
-    let (window, metal_layer) = create_window(mtm, video_config.width, video_config.height, fullscreen);
-    info!("Window created: {}x{}, fullscreen={}", video_config.width, video_config.height, fullscreen);
+    let (window, metal_layer) = create_window(mtm, display_width, display_height, fullscreen);
+    info!("Window created: {}x{}, fullscreen={}", display_width, display_height, fullscreen);
 
-    // Initialize display and set the layer
-    let mut display = MetalDisplay::new(video_config.width, video_config.height)?;
+    // Initialize display with local screen size - will render frames scaled
+    let mut display = MetalDisplay::new(display_width, display_height)?;
     display.set_layer(metal_layer);
     info!("Metal display initialized with layer");
 
-    let mut decoder = if video_config.codec != bridge_common::VideoCodec::Raw {
-        Some(VideoDecoder::new(
-            video_config.width,
-            video_config.height,
-            video_config.codec,
-        )?)
-    } else {
-        None
-    };
+    // Decoder will be created lazily when we receive first frame with actual dimensions
+    let mut decoder: Option<VideoDecoder> = None;
+    let video_codec = video_config.codec;
+    let mut actual_frame_width: Option<u32> = None;
+    let mut actual_frame_height: Option<u32> = None;
 
     let playback_config = PlaybackConfig::from(&audio_config);
     let mut player = AudioPlayer::new(playback_config)?;
@@ -444,11 +440,10 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
     // Frame reassembler for handling fragmented video frames
     let mut frame_reassembler = FrameReassembler::new();
 
-    // Latency tracking
-    let mut latency_samples: Vec<u64> = Vec::with_capacity(60);
+    // Latency tracking - only track what we can actually measure locally
     let mut decode_latency_samples: Vec<u64> = Vec::with_capacity(60);
     let mut last_latency_report = tokio::time::Instant::now();
-    let latency_report_interval = tokio::time::Duration::from_secs(1);
+    let latency_report_interval = tokio::time::Duration::from_secs(2); // Report less frequently
 
     // Packet loss tracking
     let mut expected_frame: u64 = 0;
@@ -534,14 +529,30 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
 
                         // Add fragment to reassembler
                         if let Some((complete_header, complete_data)) = frame_reassembler.add_fragment(video_header, fragment_data) {
-                            debug!("Frame {} complete ({} bytes, keyframe={})",
-                                  complete_header.frame_number, complete_data.len(), complete_header.is_keyframe);
+                            debug!("Frame {} complete ({} bytes, keyframe={}, {}x{})",
+                                  complete_header.frame_number, complete_data.len(),
+                                  complete_header.is_keyframe,
+                                  complete_header.width, complete_header.height);
+
                             // Track frame ordering for packet loss calculation
                             if complete_header.frame_number > expected_frame {
                                 dropped_frames += complete_header.frame_number - expected_frame;
                             }
                             expected_frame = complete_header.frame_number + 1;
                             received_frames += 1;
+
+                            // Create decoder lazily when we know actual frame dimensions
+                            if decoder.is_none() && video_codec != bridge_common::VideoCodec::Raw {
+                                info!("Creating decoder for {}x{} frames",
+                                      complete_header.width, complete_header.height);
+                                actual_frame_width = Some(complete_header.width);
+                                actual_frame_height = Some(complete_header.height);
+                                decoder = Some(VideoDecoder::new(
+                                    complete_header.width,
+                                    complete_header.height,
+                                    video_codec,
+                                )?);
+                            }
 
                             // Decode frame
                             let decode_start = std::time::Instant::now();
@@ -577,14 +588,9 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
                                 display.render(&frame)?;
                                 debug!("Frame rendered successfully");
 
-                                // Track latencies
-                                let network_latency = elapsed_us(complete_header.pts_us);
-                                latency_samples.push(network_latency);
+                                // Track decode latency (what we can actually measure)
                                 decode_latency_samples.push(decode_time_us);
 
-                                if latency_samples.len() > 60 {
-                                    latency_samples.remove(0);
-                                }
                                 if decode_latency_samples.len() > 60 {
                                     decode_latency_samples.remove(0);
                                 }
@@ -633,25 +639,24 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
         }
 
         // Send periodic latency reports
-        if last_latency_report.elapsed() > latency_report_interval && !latency_samples.is_empty() {
-            let avg_latency: u64 = latency_samples.iter().sum::<u64>()
-                / latency_samples.len() as u64;
-
+        // Note: We can't measure true network latency without clock sync (NTP/PTP)
+        // So we only report what we can actually measure: decode time and packet loss
+        if last_latency_report.elapsed() > latency_report_interval {
             let avg_decode: u64 = if !decode_latency_samples.is_empty() {
                 decode_latency_samples.iter().sum::<u64>() / decode_latency_samples.len() as u64
             } else {
                 0
             };
 
-            // Calculate jitter (variance in latency)
-            let jitter = if latency_samples.len() > 1 {
-                let mean = avg_latency as f64;
-                let variance: f64 = latency_samples.iter()
+            // Calculate jitter (variance in decode time as a proxy)
+            let jitter = if decode_latency_samples.len() > 1 {
+                let mean = avg_decode as f64;
+                let variance: f64 = decode_latency_samples.iter()
                     .map(|&x| {
                         let diff = x as f64 - mean;
                         diff * diff
                     })
-                    .sum::<f64>() / latency_samples.len() as f64;
+                    .sum::<f64>() / decode_latency_samples.len() as f64;
                 variance.sqrt() as u64
             } else {
                 0
@@ -665,17 +670,21 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
                 0.0
             };
 
+            // Report with placeholder RTT - we can't measure this without clock sync
+            // Use a reasonable estimate for WiFi (5-15ms typical)
+            let estimated_rtt_us = 10_000u64; // 10ms estimate
+
             let report = LatencyReport {
-                rtt_us: avg_latency * 2,
+                rtt_us: estimated_rtt_us,
                 decode_latency_us: avg_decode,
                 display_latency_us: 2000, // ~2ms for Metal rendering
                 packet_loss,
                 jitter_us: jitter,
             };
 
-            debug!("Latency: avg={}us ({:.1}ms), decode={}us, jitter={}us, loss={:.1}%, pending={}",
-                avg_latency, avg_latency as f64 / 1000.0,
-                avg_decode, jitter,
+            debug!("Stats: decode={}us ({:.1}ms), jitter={}us, loss={:.1}%, pending={}",
+                avg_decode, avg_decode as f64 / 1000.0,
+                jitter,
                 packet_loss * 100.0,
                 frame_reassembler.pending_count());
 

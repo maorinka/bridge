@@ -189,8 +189,8 @@ async fn handle_client(
     // Accept with config negotiation - create virtual display if client needs higher res
     let max_packet_size = config.max_packet_size;
 
-    // We'll store the virtual display here to keep it alive during the session
-    let mut _virtual_display: Option<VirtualDisplay> = None;
+    // Virtual display disabled for now - using native capture
+    // let mut _virtual_display: Option<VirtualDisplay> = None;
 
     let (mut conn, hello) = BridgeConnection::accept_with_negotiation(
         control_conn,
@@ -207,39 +207,15 @@ async fn handle_client(
     // Get the negotiated video config (client's request)
     let video_config = conn.video_config().cloned().unwrap();
 
-    // Check if we need to create a virtual display for higher resolution
-    let capture_width;
-    let capture_height;
-    let mut capture_display_id: Option<u32> = None;
+    // Use native resolution for now - virtual display is disabled until we fix the API
+    // TODO: Fix CGVirtualDisplay creation
+    let capture_width = native_width;
+    let capture_height = native_height;
+    let capture_display_id: Option<u32> = None;
 
     if video_config.width > native_width || video_config.height > native_height {
-        info!("Client requested {}x{}, higher than native {}x{}",
+        info!("Client requested {}x{}, using native {}x{} (virtual display disabled)",
               video_config.width, video_config.height, native_width, native_height);
-
-        if is_virtual_display_supported() {
-            match VirtualDisplay::new(video_config.width, video_config.height, video_config.fps) {
-                Ok(vd) => {
-                    info!("Created virtual display at {}x{} (ID={})",
-                          vd.width(), vd.height(), vd.display_id());
-                    capture_width = vd.width();
-                    capture_height = vd.height();
-                    capture_display_id = Some(vd.display_id());
-                    _virtual_display = Some(vd);
-                }
-                Err(e) => {
-                    warn!("Failed to create virtual display: {}. Using native resolution.", e);
-                    capture_width = native_width;
-                    capture_height = native_height;
-                }
-            }
-        } else {
-            warn!("Virtual display not supported (requires macOS 14+). Using native resolution.");
-            capture_width = native_width;
-            capture_height = native_height;
-        }
-    } else {
-        capture_width = native_width;
-        capture_height = native_height;
     }
 
     info!("Capture resolution: {}x{} @ {}fps", capture_width, capture_height, video_config.fps);
@@ -294,15 +270,13 @@ async fn handle_client(
     // Calculate fragment size based on MTU (leave room for headers)
     let fragment_size = max_packet_size - bridge_common::PacketHeader::SIZE - VideoFrameHeader::SIZE - 64;
 
-    // Adaptive bitrate control state
+    // Adaptive bitrate control state (based on packet loss only)
     let initial_bitrate = video_config.bitrate;
     let min_bitrate = 5_000_000u32;   // 5 Mbps minimum
-    let max_bitrate = 100_000_000u32; // 100 Mbps maximum
-    let target_latency_us = 16_000u64; // 16ms target for 60fps
-    let max_acceptable_latency_us = 33_000u64; // 33ms max before quality reduction
+    let max_bitrate = 20_000_000u32;  // 20 Mbps max (smaller keyframes for WiFi)
     let mut current_bitrate = initial_bitrate;
     let mut last_bitrate_adjustment = tokio::time::Instant::now();
-    let bitrate_adjustment_interval = tokio::time::Duration::from_secs(2);
+    let bitrate_adjustment_interval = tokio::time::Duration::from_secs(3); // Slower adjustments
 
     info!("Server components initialized");
 
@@ -424,20 +398,23 @@ async fn handle_client(
                                 info!("Client requested audio config: {:?}", cfg);
                             }
                             ControlMessage::LatencyReport(report) => {
-                                debug!("Latency report: RTT={}us, decode={}us, loss={:.1}%, jitter={}us",
-                                    report.rtt_us, report.decode_latency_us,
+                                debug!("Client stats: decode={}us, loss={:.1}%, jitter={}us",
+                                    report.decode_latency_us,
                                     report.packet_loss * 100.0, report.jitter_us);
 
-                                // Adaptive bitrate adjustment
+                                // Simple adaptive bitrate based only on packet loss (which we can measure)
+                                // Don't use RTT since clocks aren't synchronized
                                 if let Some(ref mut enc) = encoder {
                                     if last_bitrate_adjustment.elapsed() > bitrate_adjustment_interval {
-                                        let total_latency = report.rtt_us / 2 + report.decode_latency_us + report.display_latency_us;
-                                        let new_bitrate = if total_latency > max_acceptable_latency_us || report.packet_loss > 0.05 {
-                                            // Reduce bitrate by 20% if latency too high or packet loss > 5%
-                                            ((current_bitrate as f64) * 0.8) as u32
-                                        } else if total_latency < target_latency_us && report.packet_loss < 0.01 {
-                                            // Increase bitrate by 10% if latency is good and packet loss < 1%
-                                            ((current_bitrate as f64) * 1.1) as u32
+                                        let new_bitrate = if report.packet_loss > 0.10 {
+                                            // Significant packet loss (>10%) - reduce bitrate by 30%
+                                            ((current_bitrate as f64) * 0.7) as u32
+                                        } else if report.packet_loss > 0.03 {
+                                            // Moderate packet loss (>3%) - reduce bitrate by 15%
+                                            ((current_bitrate as f64) * 0.85) as u32
+                                        } else if report.packet_loss < 0.01 {
+                                            // Low packet loss (<1%) - increase bitrate by 5%
+                                            ((current_bitrate as f64) * 1.05) as u32
                                         } else {
                                             current_bitrate
                                         };
@@ -447,10 +424,9 @@ async fn handle_client(
                                             if let Err(e) = enc.set_bitrate(new_bitrate) {
                                                 warn!("Failed to adjust bitrate: {}", e);
                                             } else {
-                                                info!("Bitrate adjusted: {} -> {} Mbps (latency: {}us, loss: {:.1}%)",
+                                                info!("Bitrate: {} -> {} Mbps (loss: {:.1}%)",
                                                     current_bitrate / 1_000_000,
                                                     new_bitrate / 1_000_000,
-                                                    total_latency,
                                                     report.packet_loss * 100.0);
                                                 current_bitrate = new_bitrate;
                                             }
@@ -506,8 +482,8 @@ async fn handle_client(
                                         frame_size: data.len() as u32,
                                         fragment_index: i as u16,
                                         fragment_count: fragment_count as u16,
-                                        width: video_config.width,
-                                        height: video_config.height,
+                                        width: capture_width,
+                                        height: capture_height,
                                     };
 
                                     let header_bytes = match bincode::serialize(&frame_header) {

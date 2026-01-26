@@ -163,7 +163,7 @@ impl Default for VideoConfig {
             height: 2160,
             fps: 60,
             codec: VideoCodec::H265,
-            bitrate: 50_000_000, // 50 Mbps
+            bitrate: 15_000_000, // 15 Mbps - smaller keyframes for WiFi
             pixel_format: PixelFormat::Bgra8,
         }
     }

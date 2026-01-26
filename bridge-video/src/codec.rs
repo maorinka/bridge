@@ -177,15 +177,123 @@ impl VideoEncoder {
             }
         }
 
-        info!("VideoToolbox encoder session created successfully");
+        info!("VideoToolbox encoder session created, configuring properties...");
 
-        Ok(Self {
-            config,
+        // Configure encoder properties for low-latency streaming
+        let encoder = Self {
+            config: config.clone(),
             session,
             frame_rx,
             frame_count,
             _callback_ctx: callback_ctx,
-        })
+        };
+
+        // Set all the low-latency properties
+        unsafe {
+            // Set bitrate
+            let bitrate_num = cf_number_create_i64(config.bitrate as i64);
+            let status = VTSessionSetProperty(
+                encoder.session as *mut c_void,
+                kVTCompressionPropertyKey_AverageBitRate,
+                bitrate_num,
+            );
+            CFRelease(bitrate_num);
+            if status != NO_ERR {
+                warn!("Failed to set bitrate: {}", status);
+            } else {
+                info!("  Bitrate: {} Mbps", config.bitrate / 1_000_000);
+            }
+
+            // Set expected frame rate
+            let fps_num = cf_number_create_i64(config.fps as i64);
+            let status = VTSessionSetProperty(
+                encoder.session as *mut c_void,
+                kVTCompressionPropertyKey_ExpectedFrameRate,
+                fps_num,
+            );
+            CFRelease(fps_num);
+            if status != NO_ERR {
+                warn!("Failed to set frame rate: {}", status);
+            } else {
+                info!("  Frame rate: {} fps", config.fps);
+            }
+
+            // Set max keyframe interval (every 2 seconds for recovery)
+            let keyframe_interval = (config.fps * 2) as i64;
+            let keyframe_num = cf_number_create_i64(keyframe_interval);
+            let status = VTSessionSetProperty(
+                encoder.session as *mut c_void,
+                kVTCompressionPropertyKey_MaxKeyFrameInterval,
+                keyframe_num,
+            );
+            CFRelease(keyframe_num);
+            if status != NO_ERR {
+                warn!("Failed to set keyframe interval: {}", status);
+            } else {
+                info!("  Keyframe interval: {} frames", keyframe_interval);
+            }
+
+            // Disable B-frames (AllowFrameReordering = false) for lower latency
+            let status = VTSessionSetProperty(
+                encoder.session as *mut c_void,
+                kVTCompressionPropertyKey_AllowFrameReordering,
+                kCFBooleanFalse as CFTypeRef,
+            );
+            if status != NO_ERR {
+                warn!("Failed to disable frame reordering: {}", status);
+            } else {
+                info!("  Frame reordering: disabled (no B-frames)");
+            }
+
+            // Set MaxFrameDelayCount to 0 for immediate output
+            let delay_count = cf_number_create_i64(0);
+            let status = VTSessionSetProperty(
+                encoder.session as *mut c_void,
+                kVTCompressionPropertyKey_MaxFrameDelayCount,
+                delay_count,
+            );
+            CFRelease(delay_count);
+            if status != NO_ERR {
+                warn!("Failed to set max frame delay: {}", status);
+            } else {
+                info!("  Max frame delay: 0 (immediate output)");
+            }
+
+            // Enable real-time mode if configured
+            if config.realtime {
+                let status = VTSessionSetProperty(
+                    encoder.session as *mut c_void,
+                    kVTCompressionPropertyKey_RealTime,
+                    kCFBooleanTrue as CFTypeRef,
+                );
+                if status != NO_ERR {
+                    warn!("Failed to enable real-time mode: {}", status);
+                } else {
+                    info!("  Real-time mode: enabled");
+                }
+            }
+
+            // Set profile level for better compatibility
+            let profile = match config.codec {
+                VideoCodec::H265 => kVTProfileLevel_HEVC_Main_AutoLevel,
+                VideoCodec::H264 => kVTProfileLevel_H264_Main_AutoLevel,
+                VideoCodec::Raw => ptr::null(),
+            };
+            if !profile.is_null() {
+                let status = VTSessionSetProperty(
+                    encoder.session as *mut c_void,
+                    kVTCompressionPropertyKey_ProfileLevel,
+                    profile as CFTypeRef,
+                );
+                if status != NO_ERR {
+                    warn!("Failed to set profile level: {}", status);
+                }
+            }
+        }
+
+        info!("VideoToolbox encoder configured for low-latency streaming");
+
+        Ok(encoder)
     }
 
     /// Encode a captured frame
@@ -1269,16 +1377,35 @@ extern "C" fn decoder_output_callback(
 
         let frame_num = ctx.frame_count.fetch_add(1, Ordering::SeqCst);
 
+        // Check pixel format
+        let pixel_format = CVPixelBufferGetPixelFormatType(image_buffer);
+        let format_str = match pixel_format {
+            0x42475241 => "BGRA",
+            0x34323076 => "420v (NV12)",
+            0x34323066 => "420f (NV12)",
+            _ => "unknown",
+        };
+
+        // Log every 60 frames (once per second at 60fps)
+        if frame_num % 60 == 0 {
+            info!("Decoded frame {} ({}x{}, format={} 0x{:08X}, {} bytes)",
+                  frame_num, width, height, format_str, pixel_format, data.len());
+        }
+
+        // For NV12 format, the data copy won't work correctly
+        // Force disable IOSurface path for now and only use if format is BGRA
+        let use_io_surface = !io_surface.is_null() && pixel_format == 0x42475241;
+
         let frame = DecodedFrame {
             data,
             width,
             height,
             bytes_per_row,
             pts_us: presentation_time_stamp.microseconds(),
-            io_surface: if io_surface.is_null() {
-                None
-            } else {
+            io_surface: if use_io_surface {
                 Some(io_surface)
+            } else {
+                None
             },
         };
 

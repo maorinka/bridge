@@ -29,10 +29,8 @@ impl VirtualDisplay {
         info!("Creating virtual display: {}x{} @ {}Hz", width, height, refresh_rate);
 
         unsafe {
-            // Get CGVirtualDisplayDescriptor class
+            // Step 1: Create descriptor with basic properties
             let descriptor_class = class!(CGVirtualDisplayDescriptor);
-
-            // Create descriptor: [[CGVirtualDisplayDescriptor alloc] init]
             let descriptor: Retained<AnyObject> = msg_send_id![descriptor_class, new];
 
             // Set display name
@@ -52,7 +50,23 @@ impl VirtualDisplay {
             };
             let _: () = msg_send![&descriptor, setDispatchQueue: main_queue];
 
-            // Create CGVirtualDisplaySettings
+            // Step 2: Create the virtual display from descriptor FIRST
+            // (before applying settings - this is the correct order)
+            let display_class = class!(CGVirtualDisplay);
+            let display: Option<Retained<AnyObject>> = msg_send_id![
+                msg_send_id![display_class, alloc],
+                initWithDescriptor: &*descriptor
+            ];
+
+            let display = display.ok_or_else(|| {
+                BridgeError::Video("Failed to create CGVirtualDisplay".into())
+            })?;
+
+            // Get the display ID
+            let display_id: u32 = msg_send![&display, displayID];
+            info!("Virtual display created with ID={}", display_id);
+
+            // Step 3: Create settings with the display mode
             let settings_class = class!(CGVirtualDisplaySettings);
             let settings: Retained<AnyObject> = msg_send_id![settings_class, new];
 
@@ -68,35 +82,18 @@ impl VirtualDisplay {
                 refreshRate: refresh_rate as f64
             ];
 
-            // Create modes array
+            // Create modes array and set on settings
             let modes_array = NSArray::from_retained_slice(&[mode.clone()]);
-
-            // Set modes on settings
             let _: () = msg_send![&settings, setModes: &*modes_array];
 
-            // Apply settings to descriptor
-            let _: () = msg_send![&descriptor, applySettings: &*settings];
+            // Step 4: Apply settings to the DISPLAY object (not descriptor!)
+            // This is the correct API: [display applySettings:settings]
+            let success: bool = msg_send![&display, applySettings: &*settings];
+            if !success {
+                warn!("applySettings returned false, display may not have correct resolution");
+            }
 
-            // Set physical size (approximate based on ~110 PPI)
-            // Skip setting size - not critical and avoids Encode trait issues
-            // let width_mm = (width as f64 / 110.0) * 25.4;
-            // let height_mm = (height as f64 / 110.0) * 25.4;
-
-            // Create the virtual display
-            let display_class = class!(CGVirtualDisplay);
-            let display: Option<Retained<AnyObject>> = msg_send_id![
-                msg_send_id![display_class, alloc],
-                initWithDescriptor: &*descriptor
-            ];
-
-            let display = display.ok_or_else(|| {
-                BridgeError::Video("Failed to create CGVirtualDisplay".into())
-            })?;
-
-            // Get the display ID
-            let display_id: u32 = msg_send![&display, displayID];
-
-            info!("Virtual display created successfully: ID={}, {}x{}", display_id, width, height);
+            info!("Virtual display configured: ID={}, {}x{} @ {}Hz", display_id, width, height, refresh_rate);
 
             Ok(Self {
                 display,
