@@ -350,13 +350,9 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
         width: display_width,
         height: display_height,
         fps: 60,
-        codec: if is_thunderbolt {
-            bridge_common::VideoCodec::Raw // Request raw for Thunderbolt
-        } else {
-            bridge_common::VideoCodec::H265
-        },
+        codec: bridge_common::VideoCodec::H265,
         bitrate: if is_thunderbolt {
-            0 // Not meaningful for raw mode
+            200_000_000 // 200 Mbps - near-lossless for Thunderbolt
         } else {
             60_000_000 // 60 Mbps - good quality for 4K60 H.265
         },
@@ -473,10 +469,6 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
 
     // Frame reassembler for handling fragmented video frames
     let mut frame_reassembler = FrameReassembler::new();
-    if is_thunderbolt {
-        // Raw 4K frames are ~33MB with many fragments — allow more time
-        frame_reassembler.max_age_us = 500_000; // 500ms
-    }
 
     // Latency tracking - only track what we can actually measure locally
     let mut decode_latency_samples: Vec<u64> = Vec::with_capacity(60);

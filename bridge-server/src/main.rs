@@ -226,10 +226,13 @@ async fn handle_client(
         server_name,
         |hello| {
             let mut cfg = hello.video_config.clone();
-            // For Thunderbolt connections, override codec to Raw
+            // For Thunderbolt connections, use H.265 at very high bitrate
+            // Raw 4K60 BGRA = ~16 Gbps, exceeds Thunderbolt IP's ~10 Gbps limit
+            // H.265 at 200 Mbps looks near-perfect and fits easily
             if is_thunderbolt {
-                cfg.codec = bridge_common::VideoCodec::Raw;
-                info!("Thunderbolt: overriding codec to Raw (uncompressed)");
+                cfg.codec = bridge_common::VideoCodec::H265;
+                cfg.bitrate = 200_000_000; // 200 Mbps - near-lossless for Thunderbolt
+                info!("Thunderbolt: using H.265 at 200 Mbps (high quality)");
             }
             cfg
         }
@@ -590,6 +593,11 @@ async fn handle_client(
                                 ).await {
                                     warn!("Failed to send raw video fragment: {}", e);
                                 }
+
+                                // Yield every 50 fragments so QUIC keepalives can be processed
+                                if i % 50 == 49 {
+                                    tokio::task::yield_now().await;
+                                }
                             }
 
                             video_frame_number += 1;
@@ -638,6 +646,11 @@ async fn handle_client(
                                         &packet,
                                     ).await {
                                         warn!("Failed to send video fragment: {}", e);
+                                    }
+
+                                    // Yield periodically so QUIC keepalives can be processed
+                                    if i % 50 == 49 {
+                                        tokio::task::yield_now().await;
                                     }
                                 }
 

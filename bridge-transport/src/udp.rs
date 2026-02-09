@@ -169,17 +169,19 @@ impl UdpChannel {
 
     /// Receive data with header validation
     pub async fn recv(&mut self) -> BridgeResult<(PacketHeader, Bytes)> {
-        let mut buf = vec![0u8; self.max_packet_size];
+        // Reuse the pre-allocated recv buffer instead of allocating per call
+        self.recv_buffer.resize(self.max_packet_size, 0);
+        let buf = &mut self.recv_buffer[..];
 
         let len = if self.is_connected {
             // Connected socket - use recv() not recv_from()
             // recv_from() on connected socket may have issues on macOS
-            self.socket.recv(&mut buf).await.map_err(|e| {
+            self.socket.recv(buf).await.map_err(|e| {
                 BridgeError::Transport(format!("Receive failed: {}", e))
             })?
         } else {
             debug!("Waiting to receive on {:?}", self.socket.local_addr());
-            let (len, from) = self.socket.recv_from(&mut buf).await.map_err(|e| {
+            let (len, from) = self.socket.recv_from(buf).await.map_err(|e| {
                 BridgeError::Transport(format!("Receive failed: {}", e))
             })?;
             debug!("Received {} bytes from {} on {:?}", len, from, self.socket.local_addr());
