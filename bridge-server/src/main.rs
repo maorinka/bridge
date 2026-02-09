@@ -213,9 +213,9 @@ async fn handle_client(
     let mut config = config;
     if is_thunderbolt {
         config.max_packet_size = bridge_common::MAX_UDP_PACKET_SIZE_THUNDERBOLT;
-        config.send_buffer_size = 32 * 1024 * 1024; // 32MB
-        config.recv_buffer_size = 32 * 1024 * 1024;
-        info!("Thunderbolt: packet_size=65507, socket_buffers=32MB");
+        config.send_buffer_size = 64 * 1024 * 1024; // 64MB
+        config.recv_buffer_size = 64 * 1024 * 1024;
+        info!("Thunderbolt: packet_size=65507, socket_buffers=64MB");
     }
     let max_packet_size = config.max_packet_size;
 

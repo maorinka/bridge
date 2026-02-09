@@ -367,9 +367,9 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
     let mut transport_config = TransportConfig::default();
     if is_thunderbolt {
         transport_config.max_packet_size = bridge_common::MAX_UDP_PACKET_SIZE_THUNDERBOLT;
-        transport_config.send_buffer_size = 32 * 1024 * 1024; // 32MB
-        transport_config.recv_buffer_size = 32 * 1024 * 1024;
-        info!("Thunderbolt: packet_size=65507, socket_buffers=32MB");
+        transport_config.send_buffer_size = 64 * 1024 * 1024; // 64MB
+        transport_config.recv_buffer_size = 64 * 1024 * 1024;
+        info!("Thunderbolt: packet_size=65507, socket_buffers=64MB");
     }
     let mut conn = BridgeConnection::new(server_addr, transport_config);
 
@@ -538,15 +538,22 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
             app.updateWindows();
         }
 
-        // Receive video frames
+        // Receive video frames — drain all available packets in a tight loop
         if let Some(video_ch) = conn.video_channel() {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(10),
-                video_ch.recv()
-            ).await {
-                Ok(Ok((header, data))) => {
-                    if header.packet_type == bridge_common::PacketType::Video {
-                        debug!("Received video packet: {} bytes", data.len());
+            let mut packets_this_round = 0u32;
+            loop {
+                let recv_result = tokio::time::timeout(
+                    std::time::Duration::from_millis(if packets_this_round == 0 { 10 } else { 1 }),
+                    video_ch.recv()
+                ).await;
+
+                match recv_result {
+                    Ok(Ok((header, data))) => {
+                        if header.packet_type != bridge_common::PacketType::Video {
+                            continue;
+                        }
+                        packets_this_round += 1;
+
                         // Parse the VideoFrameHeader from the data
                         let video_header: VideoFrameHeader = match bincode::deserialize(&data[..VideoFrameHeader::SIZE.min(data.len())]) {
                             Ok(h) => h,
@@ -557,10 +564,9 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
                         };
 
                         // Log fragment details for debugging
-                        if video_header.is_keyframe || video_header.fragment_count > 10 {
-                            debug!("Received fragment {}/{} for frame {} (keyframe={})",
-                                   video_header.fragment_index, video_header.fragment_count,
-                                   video_header.frame_number, video_header.is_keyframe);
+                        if video_header.fragment_index == 0 {
+                            debug!("Receiving frame {} ({} fragments, keyframe={})",
+                                   video_header.frame_number, video_header.fragment_count, video_header.is_keyframe);
                         }
 
                         // Extract fragment data (after header)
@@ -568,10 +574,11 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
 
                         // Add fragment to reassembler
                         if let Some((complete_header, complete_data)) = frame_reassembler.add_fragment(video_header, fragment_data) {
-                            debug!("Frame {} complete ({} bytes, keyframe={}, {}x{})",
+                            info!("Frame {} complete ({} bytes, keyframe={}, {}x{}, {} packets drained)",
                                   complete_header.frame_number, complete_data.len(),
                                   complete_header.is_keyframe,
-                                  complete_header.width, complete_header.height);
+                                  complete_header.width, complete_header.height,
+                                  packets_this_round);
 
                             // Track frame ordering for packet loss calculation
                             if complete_header.frame_number > expected_frame {
@@ -643,14 +650,18 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
                                     decode_latency_samples.remove(0);
                                 }
                             }
+
+                            // After rendering a frame, break to process macOS events
+                            break;
                         }
                     }
+                    Ok(Err(e)) => {
+                        error!("Video receive error: {}", e);
+                        shutdown_requested = true;
+                        break;
+                    }
+                    Err(_) => break, // No more packets available, continue main loop
                 }
-                Ok(Err(e)) => {
-                    error!("Video receive error: {}", e);
-                    break;
-                }
-                Err(_) => {} // Timeout, continue
             }
         }
 
