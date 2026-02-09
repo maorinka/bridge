@@ -431,8 +431,21 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
     let mut actual_frame_height: Option<u32> = None;
 
     let playback_config = PlaybackConfig::from(&audio_config);
-    let mut player = AudioPlayer::new(playback_config)?;
-    player.start()?;
+    let mut player: Option<AudioPlayer> = match AudioPlayer::new(playback_config) {
+        Ok(mut p) => {
+            match p.start() {
+                Ok(_) => Some(p),
+                Err(e) => {
+                    warn!("Audio playback start failed: {}. Continuing without audio.", e);
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            warn!("Audio player unavailable: {}. Continuing without audio.", e);
+            None
+        }
+    };
 
     let mut input_capturer = if !args.view_only {
         let capture_config = CaptureConfig {
@@ -642,7 +655,7 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
         }
 
         // Receive audio
-        if let Some(audio_ch) = conn.audio_channel() {
+        if let (Some(ref mut p), Some(audio_ch)) = (&mut player, conn.audio_channel()) {
             match tokio::time::timeout(
                 std::time::Duration::from_millis(1),
                 audio_ch.recv()
@@ -655,7 +668,7 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
                             sample_count: header.payload_len / 8,
                             sequence: header.sequence,
                         };
-                        let _ = player.play(&packet);
+                        let _ = p.play(&packet);
                     }
                 }
                 Ok(Err(_)) => {}
@@ -739,7 +752,9 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
     if let Some(ref mut capturer) = input_capturer {
         capturer.stop()?;
     }
-    player.stop()?;
+    if let Some(ref mut p) = player {
+        let _ = p.stop();
+    }
     conn.disconnect().await?;
 
     info!("Client exiting");

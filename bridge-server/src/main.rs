@@ -464,7 +464,10 @@ async fn handle_client(
                                 info!("Client requested stream start");
                                 capturer.start().await?;
                                 if let Some(ref mut ac) = audio_capturer {
-                                    ac.start()?;
+                                    if let Err(e) = ac.start() {
+                                        warn!("Audio capture start failed: {}. Continuing without audio.", e);
+                                        audio_capturer = None;
+                                    }
                                 }
                                 is_streaming = true;
                             }
@@ -472,7 +475,7 @@ async fn handle_client(
                                 info!("Client requested stream stop");
                                 capturer.stop()?;
                                 if let Some(ref mut ac) = audio_capturer {
-                                    ac.stop()?;
+                                    let _ = ac.stop();
                                 }
                                 is_streaming = false;
                             }
@@ -682,7 +685,7 @@ async fn handle_client(
     // Clean up
     capturer.stop()?;
     if let Some(ref mut ac) = audio_capturer {
-        ac.stop()?;
+        let _ = ac.stop();
     }
     conn.disconnect().await?;
 
