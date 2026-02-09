@@ -500,7 +500,6 @@ impl Drop for ServiceBrowser {
 /// Resolve a hostname to an IP address
 pub async fn resolve_hostname(hostname: &str) -> BridgeResult<IpAddr> {
     use tokio::net::lookup_host;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     let addr = format!("{}:0", hostname);
     let addrs: Vec<_> = lookup_host(&addr).await.map_err(|e| {
@@ -512,24 +511,34 @@ pub async fn resolve_hostname(hostname: &str) -> BridgeResult<IpAddr> {
     }
 
     // Prefer addresses in this order:
-    // 1. IPv4 addresses (most compatible)
-    // 2. Global IPv6 addresses
-    // 3. Link-local addresses (last resort, may not work across interfaces)
+    // 1. Thunderbolt/link-local IPv4 (169.254.x.x) — lowest latency
+    // 2. Regular IPv4 addresses
+    // 3. Global IPv6 addresses
+    // 4. Any remaining address as fallback
 
-    // First try to find an IPv4 address
+    // First: prefer Thunderbolt link-local addresses
     for addr in &addrs {
         if let IpAddr::V4(v4) = addr.ip() {
-            if !v4.is_loopback() && !v4.is_unspecified() {
+            if is_thunderbolt_interface(&IpAddr::V4(v4)) {
+                info!("Resolved {} to Thunderbolt address {}", hostname, v4);
+                return Ok(IpAddr::V4(v4));
+            }
+        }
+    }
+
+    // Then: regular IPv4 addresses
+    for addr in &addrs {
+        if let IpAddr::V4(v4) = addr.ip() {
+            if !v4.is_loopback() && !v4.is_unspecified() && !v4.is_link_local() {
                 debug!("Resolved {} to IPv4 {}", hostname, v4);
                 return Ok(IpAddr::V4(v4));
             }
         }
     }
 
-    // Then try global IPv6 addresses
+    // Then: global IPv6 addresses
     for addr in &addrs {
         if let IpAddr::V6(v6) = addr.ip() {
-            // Skip link-local (fe80::) and loopback addresses
             let segments = v6.segments();
             let is_link_local = segments[0] == 0xfe80;
             let is_loopback = v6.is_loopback();
@@ -547,23 +556,60 @@ pub async fn resolve_hostname(hostname: &str) -> BridgeResult<IpAddr> {
     Ok(fallback)
 }
 
-/// Get all local IP addresses
+/// Get all local IP addresses using getifaddrs
 pub fn get_local_addresses() -> Vec<IpAddr> {
     let mut addresses = Vec::new();
 
-    // This is a simple implementation using getifaddrs would be more complete
-    // For now, try to get addresses by connecting to a known address
-    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
-        // Try connecting to Google's DNS to find our default route address
-        if socket.connect("8.8.8.8:53").is_ok() {
-            if let Ok(addr) = socket.local_addr() {
-                addresses.push(addr.ip());
+    unsafe {
+        let mut ifaddrs: *mut libc::ifaddrs = ptr::null_mut();
+        if libc::getifaddrs(&mut ifaddrs) != 0 {
+            // Fallback: try the UDP trick
+            if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+                if socket.connect("8.8.8.8:53").is_ok() {
+                    if let Ok(addr) = socket.local_addr() {
+                        addresses.push(addr.ip());
+                    }
+                }
             }
+            addresses.push(IpAddr::from([127, 0, 0, 1]));
+            return addresses;
         }
+
+        let mut current = ifaddrs;
+        while !current.is_null() {
+            let ifa = &*current;
+
+            // Check interface is UP and RUNNING
+            let flags = ifa.ifa_flags as i32;
+            let is_up = flags & libc::IFF_UP != 0;
+            let is_running = flags & libc::IFF_RUNNING != 0;
+            let is_loopback = flags & libc::IFF_LOOPBACK != 0;
+
+            if is_up && is_running && !is_loopback && !ifa.ifa_addr.is_null() {
+                let sa_family = (*ifa.ifa_addr).sa_family as i32;
+
+                if sa_family == libc::AF_INET {
+                    let sockaddr_in = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                    let ip = std::net::Ipv4Addr::from(u32::from_be(sockaddr_in.sin_addr.s_addr));
+                    if !ip.is_loopback() && !ip.is_unspecified() {
+                        let addr = IpAddr::V4(ip);
+                        if !addresses.contains(&addr) {
+                            addresses.push(addr);
+                        }
+                    }
+                }
+            }
+
+            current = ifa.ifa_next;
+        }
+
+        libc::freeifaddrs(ifaddrs);
     }
 
-    // Add localhost
-    addresses.push(IpAddr::from([127, 0, 0, 1]));
+    // Add localhost as fallback
+    if addresses.is_empty() {
+        addresses.push(IpAddr::from([127, 0, 0, 1]));
+    }
 
     addresses
 }
@@ -588,7 +634,10 @@ mod tests {
     fn test_get_local_addresses() {
         let addrs = get_local_addresses();
         assert!(!addrs.is_empty());
-        assert!(addrs.contains(&IpAddr::from([127, 0, 0, 1])));
+        // Should contain at least one non-loopback address (or localhost as fallback)
+        for addr in &addrs {
+            assert!(!addr.is_unspecified());
+        }
     }
 
     #[test]

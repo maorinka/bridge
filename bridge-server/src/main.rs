@@ -11,7 +11,8 @@ use bridge_common::{
 };
 use bridge_transport::{
     BridgeConnection, QuicServer, ServiceAdvertiser, TransportConfig,
-    DEFAULT_CONTROL_PORT,
+    DEFAULT_CONTROL_PORT, get_thunderbolt_address, is_thunderbolt_connection,
+    discovery::get_local_addresses,
 };
 use bridge_video::{CaptureConfig, EncoderConfig, ScreenCapturer, VideoEncoder, get_displays, virtual_display::{VirtualDisplay, is_virtual_display_supported}};
 use bridge_input::InputInjector;
@@ -78,6 +79,14 @@ async fn main() -> Result<()> {
     info!("  Port: {}", args.port);
     info!("  Resolution: {}x{} @ {}fps", args.width, args.height, args.fps);
     info!("  Bitrate: {} Mbps", args.bitrate);
+
+    // Log local addresses and Thunderbolt detection
+    let local_addrs = get_local_addresses();
+    info!("  Local addresses: {:?}", local_addrs);
+    match get_thunderbolt_address() {
+        Some(tb_addr) => info!("  Thunderbolt interface detected: {}", tb_addr.ip()),
+        None => info!("  No Thunderbolt interface detected"),
+    }
 
     // Check permissions
     if !bridge_video::is_capture_supported() {
@@ -175,7 +184,16 @@ async fn handle_client(
     audio_config: AudioConfig,
     no_audio: bool,
 ) -> Result<()> {
-    info!("Client connected from {}", control_conn.remote_addr());
+    let remote_addr = control_conn.remote_addr();
+    info!("Client connected from {}", remote_addr);
+
+    // Detect if this is a Thunderbolt connection
+    let is_thunderbolt = is_thunderbolt_connection(&remote_addr);
+    if is_thunderbolt {
+        info!("Client connected via Thunderbolt ({})", remote_addr);
+    } else {
+        info!("Client connected via WiFi/network ({})", remote_addr);
+    }
 
     // Get server's native display resolution BEFORE accepting
     let displays = get_displays();
@@ -273,8 +291,16 @@ async fn handle_client(
     // Adaptive bitrate control state (based on packet loss only)
     let initial_bitrate = video_config.bitrate;
     let min_bitrate = 5_000_000u32;   // 5 Mbps minimum
-    let max_bitrate = 20_000_000u32;  // 20 Mbps max (smaller keyframes for WiFi)
-    let mut current_bitrate = initial_bitrate;
+    let max_bitrate = if is_thunderbolt {
+        100_000_000u32  // 100 Mbps for Thunderbolt
+    } else {
+        20_000_000u32   // 20 Mbps for WiFi
+    };
+    let mut current_bitrate = if is_thunderbolt {
+        initial_bitrate.max(50_000_000) // Start higher for Thunderbolt
+    } else {
+        initial_bitrate
+    };
     let mut last_bitrate_adjustment = tokio::time::Instant::now();
     let bitrate_adjustment_interval = tokio::time::Duration::from_secs(3); // Slower adjustments
 

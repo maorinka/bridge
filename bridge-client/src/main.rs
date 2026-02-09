@@ -11,6 +11,7 @@ use bridge_common::{
 };
 use bridge_transport::{
     BridgeConnection, ServiceBrowser, TransportConfig, DEFAULT_CONTROL_PORT,
+    is_thunderbolt_connection,
 };
 use bridge_video::{MetalDisplay, VideoDecoder, DecodedFrame};
 use bridge_input::{CaptureConfig, InputCapturer};
@@ -723,8 +724,16 @@ async fn discover_server() -> Result<SocketAddr> {
         }
 
         let servers = browser.servers().await;
-        if let Some(server) = servers.first() {
-            info!("Found server: {} at {}", server.name, server.address);
+        if !servers.is_empty() {
+            // Prefer servers reachable via Thunderbolt (169.254.x.x)
+            if let Some(tb_server) = servers.iter().find(|s| is_thunderbolt_connection(&s.address)) {
+                info!("Found server via Thunderbolt: {} at {}", tb_server.name, tb_server.address);
+                return Ok(tb_server.address);
+            }
+
+            // Fall back to first available server
+            let server = &servers[0];
+            info!("Found server via network: {} at {}", server.name, server.address);
             return Ok(server.address);
         }
 

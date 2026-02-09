@@ -62,10 +62,11 @@ impl Default for TransportConfig {
 
 /// Get the local Thunderbolt IP address if available
 pub fn get_thunderbolt_address() -> Option<SocketAddr> {
-    // Thunderbolt networking creates a bridge interface
-    // On macOS, this is typically bridge0 or en5/en6
-    // For now, return None - we'll implement proper detection later
-    None
+    // Thunderbolt networking creates a bridge interface using 169.254.x.x link-local addresses
+    let addrs = discovery::get_local_addresses();
+    addrs.into_iter()
+        .find(|addr| discovery::is_thunderbolt_interface(addr))
+        .map(|ip| SocketAddr::new(ip, DEFAULT_CONTROL_PORT))
 }
 
 /// Check if running over Thunderbolt connection

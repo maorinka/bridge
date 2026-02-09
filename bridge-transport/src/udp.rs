@@ -66,11 +66,38 @@ impl UdpChannel {
         })
     }
 
-    /// Configure socket for low latency
-    fn configure_socket(_socket: &UdpSocket) -> BridgeResult<()> {
-        // These would require platform-specific code
-        // For now, we rely on default settings
-        // TODO: Set SO_SNDBUF, SO_RCVBUF, IP_TOS for QoS
+    /// Configure socket for low latency and high throughput
+    fn configure_socket(socket: &UdpSocket) -> BridgeResult<()> {
+        use std::os::unix::io::AsRawFd;
+
+        let fd = socket.as_raw_fd();
+        let buf_size: libc::c_int = 4 * 1024 * 1024; // 4MB
+
+        unsafe {
+            let ret = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &buf_size as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            if ret != 0 {
+                warn!("Failed to set SO_SNDBUF: {}", std::io::Error::last_os_error());
+            }
+
+            let ret = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &buf_size as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            if ret != 0 {
+                warn!("Failed to set SO_RCVBUF: {}", std::io::Error::last_os_error());
+            }
+        }
+
+        debug!("Socket buffers configured: send=4MB, recv=4MB");
         Ok(())
     }
 
