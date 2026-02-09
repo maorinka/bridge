@@ -530,12 +530,15 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
             app.updateWindows();
         }
 
-        // Receive video frames — drain all available packets in a tight loop
+        // Receive video frames — drain all available packets, decode all, render only latest
         if let Some(video_ch) = conn.video_channel() {
             let mut packets_this_round = 0u32;
+            let mut complete_frames: Vec<(VideoFrameHeader, Vec<u8>)> = Vec::new();
+
+            // Phase 1: Drain all available packets and collect complete frames
             loop {
                 let recv_result = tokio::time::timeout(
-                    std::time::Duration::from_millis(if packets_this_round == 0 { 10 } else { 1 }),
+                    std::time::Duration::from_millis(if packets_this_round == 0 { 10 } else { 0 }),
                     video_ch.recv()
                 ).await;
 
@@ -555,96 +558,20 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
                             }
                         };
 
-                        // Log fragment details for debugging
                         if video_header.fragment_index == 0 {
                             debug!("Receiving frame {} ({} fragments, keyframe={})",
                                    video_header.frame_number, video_header.fragment_count, video_header.is_keyframe);
                         }
 
-                        // Extract fragment data (after header)
                         let fragment_data = data[VideoFrameHeader::SIZE.min(data.len())..].to_vec();
 
-                        // Add fragment to reassembler
                         if let Some((complete_header, complete_data)) = frame_reassembler.add_fragment(video_header, fragment_data) {
-                            info!("Frame {} complete ({} bytes, keyframe={}, {}x{}, {} packets drained)",
-                                  complete_header.frame_number, complete_data.len(),
-                                  complete_header.is_keyframe,
-                                  complete_header.width, complete_header.height,
-                                  packets_this_round);
-
-                            // Track frame ordering for packet loss calculation
                             if complete_header.frame_number > expected_frame {
                                 dropped_frames += complete_header.frame_number - expected_frame;
                             }
                             expected_frame = complete_header.frame_number + 1;
                             received_frames += 1;
-
-                            // Create decoder lazily when we know actual frame dimensions
-                            if decoder.is_none() && video_codec != bridge_common::VideoCodec::Raw {
-                                info!("Creating decoder for {}x{} frames",
-                                      complete_header.width, complete_header.height);
-                                actual_frame_width = Some(complete_header.width);
-                                actual_frame_height = Some(complete_header.height);
-                                decoder = Some(VideoDecoder::new(
-                                    complete_header.width,
-                                    complete_header.height,
-                                    video_codec,
-                                )?);
-                            }
-
-                            // Decode frame
-                            let decode_start = std::time::Instant::now();
-                            let decoded = if let Some(ref mut dec) = decoder {
-                                let encoded = bridge_video::EncodedFrame {
-                                    data: complete_data.into(),
-                                    pts_us: complete_header.pts_us,
-                                    dts_us: complete_header.pts_us,
-                                    is_keyframe: complete_header.is_keyframe,
-                                    frame_number: complete_header.frame_number,
-                                };
-
-                                dec.decode(&encoded)?;
-                                dec.recv_frame()
-                            } else {
-                                Some(DecodedFrame {
-                                    data: complete_data,
-                                    width: complete_header.width,
-                                    height: complete_header.height,
-                                    bytes_per_row: complete_header.width * 4,
-                                    pts_us: complete_header.pts_us,
-                                    io_surface: None,
-                                })
-                            };
-                            let decode_time_us = decode_start.elapsed().as_micros() as u64;
-
-                            if decoded.is_none() {
-                                debug!("Decoder produced no output for frame {}", complete_header.frame_number);
-                            }
-
-                            // Request keyframe if decoder needs one (throttle to once per second)
-                            if let Some(ref dec) = decoder {
-                                if dec.needs_keyframe() && last_keyframe_request.elapsed() > std::time::Duration::from_secs(1) {
-                                    info!("Decoder needs keyframe, requesting from server");
-                                    conn.send_control(ControlMessage::RequestKeyframe).await?;
-                                    last_keyframe_request = tokio::time::Instant::now();
-                                }
-                            }
-
-                            if let Some(frame) = decoded {
-                                debug!("Decoded frame: {}x{}, rendering...", frame.width, frame.height);
-                                display.render(&frame)?;
-                                debug!("Frame rendered successfully");
-
-                                // Track decode latency (what we can actually measure)
-                                decode_latency_samples.push(decode_time_us);
-
-                                if decode_latency_samples.len() > 60 {
-                                    decode_latency_samples.remove(0);
-                                }
-                            }
-
-                            // After rendering a frame, break to process macOS events
-                            break;
+                            complete_frames.push((complete_header, complete_data));
                         }
                     }
                     Ok(Err(e)) => {
@@ -652,7 +579,81 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
                         shutdown_requested = true;
                         break;
                     }
-                    Err(_) => break, // No more packets available, continue main loop
+                    Err(_) => break,
+                }
+            }
+
+            // Phase 2: Decode ALL frames (H.265 needs reference chain), render only the last
+            let frame_count = complete_frames.len();
+            for (i, (complete_header, complete_data)) in complete_frames.into_iter().enumerate() {
+                let is_last = i == frame_count - 1;
+
+                if is_last {
+                    info!("Frame {} complete ({} bytes, keyframe={}, {}x{}, {} pkts, skipped {})",
+                          complete_header.frame_number, complete_data.len(),
+                          complete_header.is_keyframe,
+                          complete_header.width, complete_header.height,
+                          packets_this_round, frame_count - 1);
+                }
+
+                // Create decoder lazily
+                if decoder.is_none() && video_codec != bridge_common::VideoCodec::Raw {
+                    info!("Creating decoder for {}x{} frames",
+                          complete_header.width, complete_header.height);
+                    actual_frame_width = Some(complete_header.width);
+                    actual_frame_height = Some(complete_header.height);
+                    decoder = Some(VideoDecoder::new(
+                        complete_header.width,
+                        complete_header.height,
+                        video_codec,
+                    )?);
+                }
+
+                // Decode every frame to maintain reference chain
+                let decode_start = std::time::Instant::now();
+                let decoded = if let Some(ref mut dec) = decoder {
+                    let encoded = bridge_video::EncodedFrame {
+                        data: complete_data.into(),
+                        pts_us: complete_header.pts_us,
+                        dts_us: complete_header.pts_us,
+                        is_keyframe: complete_header.is_keyframe,
+                        frame_number: complete_header.frame_number,
+                    };
+                    dec.decode(&encoded)?;
+                    // Only retrieve decoded output for the last frame (saves work)
+                    if is_last { dec.recv_frame() } else { let _ = dec.recv_frame(); None }
+                } else if is_last {
+                    Some(DecodedFrame {
+                        data: complete_data,
+                        width: complete_header.width,
+                        height: complete_header.height,
+                        bytes_per_row: complete_header.width * 4,
+                        pts_us: complete_header.pts_us,
+                        io_surface: None,
+                    })
+                } else {
+                    None
+                };
+                let decode_time_us = decode_start.elapsed().as_micros() as u64;
+
+                // Request keyframe if decoder needs one
+                if let Some(ref dec) = decoder {
+                    if dec.needs_keyframe() && last_keyframe_request.elapsed() > std::time::Duration::from_secs(1) {
+                        info!("Decoder needs keyframe, requesting from server");
+                        conn.send_control(ControlMessage::RequestKeyframe).await?;
+                        last_keyframe_request = tokio::time::Instant::now();
+                    }
+                }
+
+                // Only render the latest frame
+                if let Some(frame) = decoded {
+                    debug!("Decoded frame: {}x{}, rendering...", frame.width, frame.height);
+                    display.render(&frame)?;
+
+                    decode_latency_samples.push(decode_time_us);
+                    if decode_latency_samples.len() > 60 {
+                        decode_latency_samples.remove(0);
+                    }
                 }
             }
         }
