@@ -279,6 +279,28 @@ impl ScreenCapturer {
         self.is_stopped.load(Ordering::SeqCst)
     }
 
+    /// Restart capture (e.g. after display disconnect, optionally on a new display)
+    pub async fn restart(&mut self, new_display_id: Option<u32>) -> BridgeResult<()> {
+        info!("Restarting capture (new display_id={:?})", new_display_id);
+
+        // Stop current stream if running
+        let _ = self.stop();
+
+        // Reset stopped flag
+        self.is_stopped.store(false, Ordering::SeqCst);
+
+        // Update display ID if provided
+        if let Some(id) = new_display_id {
+            self.config.display_id = Some(id);
+        }
+
+        // Drain any old frames
+        while self.frame_rx.try_recv().is_ok() {}
+
+        // Start fresh
+        self.start().await
+    }
+
     /// Get the next captured frame
     pub fn recv_frame(&self) -> Option<CapturedFrame> {
         match self.frame_rx.try_recv() {

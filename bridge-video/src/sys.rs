@@ -149,6 +149,13 @@ extern "C" {
         bytes: *const u8,
         length: isize,
     ) -> *mut c_void;
+
+    pub fn CFArrayCreate(
+        allocator: CFAllocatorRef,
+        values: *const *const c_void,
+        num_values: isize,
+        callbacks: *const c_void,
+    ) -> *mut c_void;
 }
 
 // CoreVideo pixel buffer keys

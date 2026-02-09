@@ -550,8 +550,54 @@ async fn handle_client(
             _ = tokio::time::sleep(std::time::Duration::from_millis(1)), if is_streaming => {
                 // Check if capture was stopped externally (e.g. display disconnected)
                 if capturer.is_stopped() {
-                    error!("Display was disconnected — stopping stream");
-                    break;
+                    warn!("Display was disconnected — attempting to restart capture");
+
+                    // Try to create a virtual display and restart capture
+                    let mut new_display_id = None;
+                    if is_virtual_display_supported() {
+                        match VirtualDisplay::new(capture_width, capture_height, video_config.fps) {
+                            Ok(vd) => {
+                                info!("Virtual display created after disconnect: {}x{} (ID={})",
+                                      vd.width(), vd.height(), vd.display_id());
+                                new_display_id = Some(vd.display_id());
+                                _virtual_display = Some(vd);
+                            }
+                            Err(e) => {
+                                warn!("Failed to create virtual display: {}", e);
+                            }
+                        }
+                    }
+
+                    // Small delay for macOS to register display changes
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+                    match capturer.restart(new_display_id).await {
+                        Ok(()) => {
+                            info!("Capture restarted successfully");
+                            // Recreate encoder for clean state
+                            if !is_raw_mode {
+                                let mut encoder_config = EncoderConfig::from(&capture_video_config);
+                                if is_thunderbolt {
+                                    encoder_config.max_quality = true;
+                                }
+                                match VideoEncoder::new(encoder_config) {
+                                    Ok(new_enc) => {
+                                        encoder = Some(new_enc);
+                                        info!("Encoder restarted");
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to restart encoder: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        Err(e) => {
+                            error!("Failed to restart capture: {} — disconnecting", e);
+                            break;
+                        }
+                    }
                 }
 
                 // Process video frames

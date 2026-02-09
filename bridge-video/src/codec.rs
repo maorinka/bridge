@@ -297,43 +297,39 @@ impl VideoEncoder {
                 }
             }
 
-            // For max quality mode: set Quality property and allow high burst rates
+            // For max quality mode: use DataRateLimits to allow high burst rates
+            // Note: We do NOT set Quality=1.0 because it makes the encoder prioritize
+            // quality over speed, adding significant latency. High bitrate alone gives
+            // excellent quality without the latency penalty.
             if config.max_quality {
-                // Quality = 1.0 (maximum)
-                let quality_num = cf_number_create_f64(1.0);
-                let status = VTSessionSetProperty(
-                    encoder.session as *mut c_void,
-                    kVTCompressionPropertyKey_Quality,
-                    quality_num,
-                );
-                CFRelease(quality_num);
-                if status != NO_ERR {
-                    warn!("Failed to set quality: {}", status);
-                } else {
-                    info!("  Quality: maximum (1.0)");
-                }
-
                 // DataRateLimits: allow burst up to 4x average bitrate per second
-                let burst_limit = config.bitrate as i64 * 4;
-                let one_second: i64 = 1;
-                let limits = [burst_limit, one_second];
-                let limits_data = CFDataCreate(
-                    kCFAllocatorDefault,
-                    limits.as_ptr() as *const u8,
-                    (limits.len() * std::mem::size_of::<i64>()) as isize,
-                );
-                if !limits_data.is_null() {
-                    let status = VTSessionSetProperty(
-                        encoder.session as *mut c_void,
-                        kVTCompressionPropertyKey_DataRateLimits,
-                        limits_data as CFTypeRef,
+                // Format: CFArray of [bytes_per_period: CFNumber, period_seconds: CFNumber]
+                let burst_bytes = (config.bitrate as i64 * 4) / 8; // 4x bitrate in bytes
+                let burst_num = cf_number_create_i64(burst_bytes);
+                let period_num = cf_number_create_f64(1.0); // 1 second period
+                if !burst_num.is_null() && !period_num.is_null() {
+                    let values = [burst_num, period_num];
+                    let limits_array = CFArrayCreate(
+                        kCFAllocatorDefault,
+                        values.as_ptr() as *const *const c_void,
+                        2,
+                        std::ptr::null(),
                     );
-                    CFRelease(limits_data as CFTypeRef);
-                    if status != NO_ERR {
-                        warn!("Failed to set data rate limits: {}", status);
-                    } else {
-                        info!("  Data rate limit: {} Mbps burst", burst_limit / 1_000_000);
+                    if !limits_array.is_null() {
+                        let status = VTSessionSetProperty(
+                            encoder.session as *mut c_void,
+                            kVTCompressionPropertyKey_DataRateLimits,
+                            limits_array as CFTypeRef,
+                        );
+                        CFRelease(limits_array as CFTypeRef);
+                        if status != NO_ERR {
+                            warn!("Failed to set data rate limits: {}", status);
+                        } else {
+                            info!("  Data rate limit: {} MB/s burst", burst_bytes / 1_000_000);
+                        }
                     }
+                    CFRelease(burst_num);
+                    CFRelease(period_num);
                 }
             }
         }
