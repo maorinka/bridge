@@ -244,9 +244,15 @@ async fn handle_client(
     let video_config = conn.video_config().cloned().unwrap();
 
     // Determine capture resolution and display ID
+    // For Thunderbolt: always create virtual display at client's requested resolution
+    // For other connections: use native display if resolution matches, otherwise try virtual
     let mut _virtual_display: Option<VirtualDisplay> = None;
-    let (capture_width, capture_height, capture_display_id) = if !has_physical_display {
-        // Headless: must create virtual display
+    let need_virtual_display = !has_physical_display
+        || is_thunderbolt  // Always use virtual display for Thunderbolt to guarantee resolution match
+        || video_config.width != native_width
+        || video_config.height != native_height;
+
+    let (capture_width, capture_height, capture_display_id) = if need_virtual_display {
         let vd_width = if video_config.width > 0 { video_config.width } else { 3840 };
         let vd_height = if video_config.height > 0 { video_config.height } else { 2160 };
 
@@ -261,38 +267,24 @@ async fn handle_client(
                     (w, h, Some(id))
                 }
                 Err(e) => {
-                    error!("Failed to create virtual display: {}. No display available!", e);
-                    return Err(anyhow::anyhow!("No display available: headless and virtual display failed: {}", e));
+                    if has_physical_display {
+                        warn!("Virtual display failed ({}), falling back to native {}x{}", e, native_width, native_height);
+                        (native_width, native_height, None)
+                    } else {
+                        error!("Failed to create virtual display: {}. No display available!", e);
+                        return Err(anyhow::anyhow!("No display available: {}", e));
+                    }
                 }
             }
+        } else if has_physical_display {
+            info!("Virtual display not supported, using native {}x{}", native_width, native_height);
+            (native_width, native_height, None)
         } else {
             error!("Headless mode requires macOS 14+ for virtual display support");
-            return Err(anyhow::anyhow!("No display available: headless and virtual display not supported"));
-        }
-    } else if video_config.width > native_width || video_config.height > native_height {
-        // Client wants higher res than native — try virtual display
-        if is_virtual_display_supported() {
-            match VirtualDisplay::new(video_config.width, video_config.height, video_config.fps) {
-                Ok(vd) => {
-                    let id = vd.display_id();
-                    let w = vd.width();
-                    let h = vd.height();
-                    info!("Virtual display created for upscale: {}x{} (ID={})", w, h, id);
-                    _virtual_display = Some(vd);
-                    (w, h, Some(id))
-                }
-                Err(e) => {
-                    warn!("Virtual display failed ({}), falling back to native {}x{}", e, native_width, native_height);
-                    (native_width, native_height, None)
-                }
-            }
-        } else {
-            info!("Client requested {}x{}, using native {}x{} (virtual display not supported)",
-                  video_config.width, video_config.height, native_width, native_height);
-            (native_width, native_height, None)
+            return Err(anyhow::anyhow!("No display available: virtual display not supported"));
         }
     } else {
-        // Native display is fine
+        // Native display matches requested resolution
         (native_width, native_height, None)
     };
 
