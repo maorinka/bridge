@@ -163,7 +163,7 @@ impl Default for VideoConfig {
             height: 2160,
             fps: 60,
             codec: VideoCodec::H265,
-            bitrate: 8_000_000, // 8 Mbps - smaller keyframes for WiFi
+            bitrate: 50_000_000, // 50 Mbps - good quality for 4K60 H.265
             pixel_format: PixelFormat::Bgra8,
         }
     }
@@ -246,7 +246,7 @@ impl Default for AudioConfig {
             channels: 2,
             codec: AudioCodec::Raw,
             bits_per_sample: 32, // Float32
-            buffer_size: 480, // 10ms at 48kHz
+            buffer_size: 960, // 20ms at 48kHz
         }
     }
 }

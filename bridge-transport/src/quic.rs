@@ -185,7 +185,8 @@ fn configure_client() -> ClientConfig {
         .with_no_client_auth();
 
     ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(crypto).unwrap(),
+        quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
+            .expect("Failed to create QUIC client config from rustls config"),
     ))
 }
 
@@ -241,8 +242,11 @@ fn configure_server() -> BridgeResult<(ServerConfig, CertificateDer<'static>)> {
     .map_err(|e| BridgeError::Transport(format!("Failed to configure server: {}", e)))?;
 
     // Configure transport for low latency
-    let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
-    transport_config.max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
+    if let Some(transport_config) = Arc::get_mut(&mut server_config.transport) {
+        if let Ok(timeout) = std::time::Duration::from_secs(10).try_into() {
+            transport_config.max_idle_timeout(Some(timeout));
+        }
+    }
 
     Ok((server_config, cert_der))
 }

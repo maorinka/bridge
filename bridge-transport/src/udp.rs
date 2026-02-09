@@ -366,7 +366,9 @@ impl FrameReceiver {
             // Check if frame is complete
             if pending.received_count == pending.fragments.len() {
                 let frame_num = frame_header.frame_number;
-                let pending = self.pending_frames.remove(&frame_num).unwrap();
+                let Some(pending) = self.pending_frames.remove(&frame_num) else {
+                    continue;
+                };
 
                 // Reassemble frame
                 let mut frame_data = Vec::with_capacity(pending.total_size);

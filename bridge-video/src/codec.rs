@@ -76,7 +76,7 @@ impl Default for EncoderConfig {
             width: 1920,
             height: 1080,
             fps: 60,
-            bitrate: 20_000_000, // 20 Mbps
+            bitrate: 60_000_000, // 60 Mbps
             codec: VideoCodec::H265,
             keyframe_interval: 60, // 1 second at 60fps
             low_latency: true,
@@ -102,6 +102,7 @@ impl From<&VideoConfig> for EncoderConfig {
 struct EncoderCallbackContext {
     frame_tx: Sender<EncodedFrame>,
     frame_count: Arc<AtomicU64>,
+    drop_count: Arc<AtomicU64>,
     codec: VideoCodec,
 }
 
@@ -145,9 +146,11 @@ impl VideoEncoder {
             VideoCodec::Raw => unreachable!(),
         };
 
+        let drop_count = Arc::new(AtomicU64::new(0));
         let callback_ctx = Box::new(EncoderCallbackContext {
             frame_tx,
             frame_count: frame_count.clone(),
+            drop_count: drop_count.clone(),
             codec: config.codec,
         });
 
@@ -218,8 +221,8 @@ impl VideoEncoder {
                 info!("  Frame rate: {} fps", config.fps);
             }
 
-            // Set max keyframe interval (every 0.5 seconds for fast recovery on lossy connections)
-            let keyframe_interval = (config.fps / 2) as i64;
+            // Set max keyframe interval (every 2 seconds - balances recovery time vs compression efficiency)
+            let keyframe_interval = (config.fps * 2) as i64;
             let keyframe_num = cf_number_create_i64(keyframe_interval);
             let status = VTSessionSetProperty(
                 encoder.session as *mut c_void,
@@ -588,7 +591,10 @@ extern "C" fn encoder_output_callback(
         };
 
         if let Err(e) = ctx.frame_tx.try_send(frame) {
-            debug!("Encoded frame dropped: {}", e);
+            let drops = ctx.drop_count.fetch_add(1, Ordering::Relaxed) + 1;
+            if drops % 30 == 1 {
+                warn!("Encoded frame dropped (total: {}): {}", drops, e);
+            }
         }
     }
 }
@@ -679,6 +685,8 @@ pub struct VideoDecoder {
     frame_count: Arc<AtomicU64>,
     _callback_ctx: Box<DecoderCallbackContext>,
     initialized: bool,
+    /// Set to true when the decoder needs a keyframe to initialize or recover
+    needs_keyframe: bool,
 }
 
 unsafe impl Send for VideoDecoder {}
@@ -719,6 +727,7 @@ impl VideoDecoder {
             frame_count,
             _callback_ctx: callback_ctx,
             initialized: false,
+            needs_keyframe: true,
         })
     }
 
@@ -859,10 +868,12 @@ impl VideoDecoder {
         }
 
         if !self.initialized || self.session.is_null() {
-            // Wait for keyframe with parameter sets
-            debug!("Decoder not initialized, waiting for keyframe (frame.is_keyframe={})", frame.is_keyframe);
+            // Signal that we need a keyframe so the client can request one
+            self.needs_keyframe = true;
+            warn!("Decoder not initialized, dropping frame {} (need keyframe)", frame.frame_number);
             return Ok(());
         }
+        self.needs_keyframe = false;
 
         if self.format_desc.is_null() {
             warn!("Format description is NULL - decoder not properly initialized");
@@ -1306,6 +1317,11 @@ impl VideoDecoder {
         self.initialized
     }
 
+    /// Check if the decoder needs a keyframe to initialize or recover
+    pub fn needs_keyframe(&self) -> bool {
+        self.needs_keyframe
+    }
+
     /// Flush pending frames
     pub fn flush(&mut self) -> BridgeResult<()> {
         if !self.session.is_null() {
@@ -1410,7 +1426,7 @@ extern "C" fn decoder_output_callback(
         };
 
         if let Err(e) = ctx.frame_tx.try_send(frame) {
-            debug!("Decoded frame dropped: {}", e);
+            warn!("Decoded frame dropped (consumer too slow): {}", e);
         } else {
             debug!("Decoded frame {} ({}x{})", frame_num, width, height);
         }

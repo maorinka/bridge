@@ -30,8 +30,8 @@ impl Default for PlaybackConfig {
         Self {
             sample_rate: 48000,
             channels: 2,
-            buffer_size: 480, // 10ms at 48kHz
-            buffer_count: 2,   // 20ms total buffering
+            buffer_size: 960, // 20ms at 48kHz
+            buffer_count: 4,   // 80ms total jitter buffer
         }
     }
 }
@@ -191,10 +191,7 @@ impl AudioPlayer {
         // Convert bytes back to f32 samples
         let samples: Vec<f32> = packet.data
             .chunks_exact(4)
-            .map(|chunk| {
-                let bytes: [u8; 4] = chunk.try_into().unwrap();
-                f32::from_le_bytes(bytes)
-            })
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect();
 
         self.sample_tx.send(samples)

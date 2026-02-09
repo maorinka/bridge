@@ -58,7 +58,7 @@ impl FrameReassembler {
         Self {
             pending_frames: HashMap::new(),
             last_completed_frame: 0,
-            max_age_us: 500_000, // 500ms timeout for incomplete frames (keyframes can be large)
+            max_age_us: 200_000, // 200ms timeout for incomplete frames
         }
     }
 
@@ -345,7 +345,7 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
         height: display_height,
         fps: 60,
         codec: bridge_common::VideoCodec::H265,
-        bitrate: 15_000_000, // 15 Mbps - smaller keyframes for WiFi reliability
+        bitrate: 60_000_000, // 60 Mbps - good quality for 4K60 H.265
         pixel_format: bridge_common::PixelFormat::Bgra8,
     };
 
@@ -450,6 +450,7 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
     let mut expected_frame: u64 = 0;
     let mut received_frames: u64 = 0;
     let mut dropped_frames: u64 = 0;
+    let mut last_keyframe_request = tokio::time::Instant::now();
 
     // Set up signal handlers for graceful shutdown
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -582,6 +583,15 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
 
                             if decoded.is_none() {
                                 debug!("Decoder produced no output for frame {}", complete_header.frame_number);
+                            }
+
+                            // Request keyframe if decoder needs one (throttle to once per second)
+                            if let Some(ref dec) = decoder {
+                                if dec.needs_keyframe() && last_keyframe_request.elapsed() > std::time::Duration::from_secs(1) {
+                                    info!("Decoder needs keyframe, requesting from server");
+                                    conn.send_control(ControlMessage::RequestKeyframe).await?;
+                                    last_keyframe_request = tokio::time::Instant::now();
+                                }
                             }
 
                             if let Some(frame) = decoded {

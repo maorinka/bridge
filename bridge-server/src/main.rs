@@ -290,19 +290,19 @@ async fn handle_client(
 
     // Adaptive bitrate control state (based on packet loss only)
     let initial_bitrate = video_config.bitrate;
-    let min_bitrate = 5_000_000u32;   // 5 Mbps minimum
+    let min_bitrate = 15_000_000u32;  // 15 Mbps minimum (below this 4K is unwatchable)
     let max_bitrate = if is_thunderbolt {
-        100_000_000u32  // 100 Mbps for Thunderbolt
+        200_000_000u32  // 200 Mbps for Thunderbolt
     } else {
-        20_000_000u32   // 20 Mbps for WiFi
+        80_000_000u32   // 80 Mbps for WiFi (802.11ac can handle this)
     };
     let mut current_bitrate = if is_thunderbolt {
-        initial_bitrate.max(50_000_000) // Start higher for Thunderbolt
+        initial_bitrate.max(80_000_000) // Start high for Thunderbolt
     } else {
         initial_bitrate
     };
     let mut last_bitrate_adjustment = tokio::time::Instant::now();
-    let bitrate_adjustment_interval = tokio::time::Duration::from_secs(3); // Slower adjustments
+    let bitrate_adjustment_interval = tokio::time::Duration::from_secs(2);
 
     info!("Server components initialized");
 
@@ -433,14 +433,14 @@ async fn handle_client(
                                 if let Some(ref mut enc) = encoder {
                                     if last_bitrate_adjustment.elapsed() > bitrate_adjustment_interval {
                                         let new_bitrate = if report.packet_loss > 0.10 {
-                                            // Significant packet loss (>10%) - reduce bitrate by 30%
-                                            ((current_bitrate as f64) * 0.7) as u32
+                                            // Significant packet loss (>10%) - reduce bitrate by 20%
+                                            ((current_bitrate as f64) * 0.80) as u32
                                         } else if report.packet_loss > 0.03 {
-                                            // Moderate packet loss (>3%) - reduce bitrate by 15%
-                                            ((current_bitrate as f64) * 0.85) as u32
+                                            // Moderate packet loss (>3%) - reduce bitrate by 10%
+                                            ((current_bitrate as f64) * 0.90) as u32
                                         } else if report.packet_loss < 0.01 {
-                                            // Low packet loss (<1%) - increase bitrate by 5%
-                                            ((current_bitrate as f64) * 1.05) as u32
+                                            // Low packet loss (<1%) - increase bitrate by 15%
+                                            ((current_bitrate as f64) * 1.15) as u32
                                         } else {
                                             current_bitrate
                                         };
