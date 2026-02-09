@@ -189,13 +189,50 @@ fn configure_client() -> ClientConfig {
     ))
 }
 
-/// Configure QUIC server with self-signed certificate
-fn configure_server() -> BridgeResult<(ServerConfig, CertificateDer<'static>)> {
-    let cert = rcgen::generate_simple_self_signed(vec!["bridge".into()])
-        .map_err(|e| BridgeError::Transport(format!("Failed to generate cert: {}", e)))?;
+/// Get the path to the server certificate/key storage directory
+fn get_server_cert_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let bridge_dir = PathBuf::from(home).join(".bridge");
+    let _ = fs::create_dir_all(&bridge_dir);
+    bridge_dir
+}
 
-    let cert_der = CertificateDer::from(cert.cert);
-    let key_der = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+/// Configure QUIC server with persistent self-signed certificate.
+/// The cert/key are saved to ~/.bridge/ so they survive server restarts,
+/// avoiding TOFU fingerprint mismatches on the client side.
+fn configure_server() -> BridgeResult<(ServerConfig, CertificateDer<'static>)> {
+    let cert_dir = get_server_cert_dir();
+    let cert_path = cert_dir.join("server.cert");
+    let key_path = cert_dir.join("server.key");
+
+    let (cert_der, key_der) = if cert_path.exists() && key_path.exists() {
+        // Load existing cert and key
+        let cert_bytes = fs::read(&cert_path)
+            .map_err(|e| BridgeError::Transport(format!("Failed to read cert: {}", e)))?;
+        let key_bytes = fs::read(&key_path)
+            .map_err(|e| BridgeError::Transport(format!("Failed to read key: {}", e)))?;
+        info!("Loaded server certificate from {:?}", cert_path);
+        (
+            CertificateDer::from(cert_bytes),
+            PrivatePkcs8KeyDer::from(key_bytes),
+        )
+    } else {
+        // Generate new cert and key, then persist
+        let cert = rcgen::generate_simple_self_signed(vec!["bridge".into()])
+            .map_err(|e| BridgeError::Transport(format!("Failed to generate cert: {}", e)))?;
+
+        let cert_der = CertificateDer::from(cert.cert);
+        let key_bytes = cert.key_pair.serialize_der();
+        let key_der = PrivatePkcs8KeyDer::from(key_bytes.clone());
+
+        fs::write(&cert_path, cert_der.as_ref())
+            .map_err(|e| BridgeError::Transport(format!("Failed to save cert: {}", e)))?;
+        fs::write(&key_path, &key_bytes)
+            .map_err(|e| BridgeError::Transport(format!("Failed to save key: {}", e)))?;
+
+        info!("Generated and saved new server certificate to {:?}", cert_path);
+        (cert_der, key_der)
+    };
 
     let mut server_config = ServerConfig::with_single_cert(
         vec![cert_der.clone()],
