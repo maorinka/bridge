@@ -101,9 +101,9 @@ impl BridgeConnection {
         let audio_addr = SocketAddr::new(self.remote_addr.ip(), welcome.audio_port);
         let input_addr = SocketAddr::new(self.remote_addr.ip(), self.config.input_port);
 
-        self.video_channel = Some(UdpChannel::connect(video_addr, self.config.max_packet_size).await?);
-        self.audio_channel = Some(UdpChannel::connect(audio_addr, self.config.max_packet_size).await?);
-        self.input_channel = Some(UdpChannel::connect(input_addr, self.config.max_packet_size).await?);
+        self.video_channel = Some(UdpChannel::connect_with_buffers(video_addr, self.config.max_packet_size, self.config.send_buffer_size).await?);
+        self.audio_channel = Some(UdpChannel::connect_with_buffers(audio_addr, self.config.max_packet_size, self.config.send_buffer_size).await?);
+        self.input_channel = Some(UdpChannel::connect_with_buffers(input_addr, self.config.max_packet_size, self.config.send_buffer_size).await?);
 
         self.video_config = Some(welcome.video_config.clone());
         self.audio_config = Some(welcome.audio_config.clone());
@@ -156,9 +156,9 @@ impl BridgeConnection {
         info!("Negotiated video config: {}x{} @ {}fps", video_config.width, video_config.height, video_config.fps);
 
         // Set up UDP channels
-        let video_channel = UdpChannel::bind(config.video_port, config.max_packet_size).await?;
-        let audio_channel = UdpChannel::bind(config.audio_port, config.max_packet_size).await?;
-        let input_channel = UdpChannel::bind(config.input_port, config.max_packet_size).await?;
+        let video_channel = UdpChannel::bind_with_buffers(config.video_port, config.max_packet_size, config.send_buffer_size).await?;
+        let audio_channel = UdpChannel::bind_with_buffers(config.audio_port, config.max_packet_size, config.send_buffer_size).await?;
+        let input_channel = UdpChannel::bind_with_buffers(config.input_port, config.max_packet_size, config.send_buffer_size).await?;
 
         // Send Welcome response with actual config server will use
         let welcome = WelcomeMessage {

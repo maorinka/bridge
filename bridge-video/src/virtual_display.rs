@@ -95,6 +95,10 @@ impl VirtualDisplay {
 
             info!("Virtual display configured: ID={}, {}x{} @ {}Hz", display_id, width, height, refresh_rate);
 
+            // Give macOS time to register the virtual display before capture starts
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            info!("Virtual display stabilization delay complete");
+
             Ok(Self {
                 display,
                 display_id,

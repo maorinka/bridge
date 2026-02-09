@@ -339,18 +339,38 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
         }
     };
 
+    // Detect if connecting via Thunderbolt
+    let is_thunderbolt = bridge_transport::is_thunderbolt_connection(&server_addr);
+    if is_thunderbolt {
+        info!("Connecting via Thunderbolt to {}", server_addr);
+    }
+
     // Create video config with client's display resolution
     let requested_video_config = bridge_common::VideoConfig {
         width: display_width,
         height: display_height,
         fps: 60,
-        codec: bridge_common::VideoCodec::H265,
-        bitrate: 60_000_000, // 60 Mbps - good quality for 4K60 H.265
+        codec: if is_thunderbolt {
+            bridge_common::VideoCodec::Raw // Request raw for Thunderbolt
+        } else {
+            bridge_common::VideoCodec::H265
+        },
+        bitrate: if is_thunderbolt {
+            0 // Not meaningful for raw mode
+        } else {
+            60_000_000 // 60 Mbps - good quality for 4K60 H.265
+        },
         pixel_format: bridge_common::PixelFormat::Bgra8,
     };
 
-    // Connect to server
-    let transport_config = TransportConfig::default();
+    // Connect to server — use larger packets and buffers for Thunderbolt
+    let mut transport_config = TransportConfig::default();
+    if is_thunderbolt {
+        transport_config.max_packet_size = bridge_common::MAX_UDP_PACKET_SIZE_THUNDERBOLT;
+        transport_config.send_buffer_size = 32 * 1024 * 1024; // 32MB
+        transport_config.recv_buffer_size = 32 * 1024 * 1024;
+        info!("Thunderbolt: packet_size=65507, socket_buffers=32MB");
+    }
     let mut conn = BridgeConnection::new(server_addr, transport_config);
 
     let welcome = conn.connect_with_config(
@@ -440,6 +460,10 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
 
     // Frame reassembler for handling fragmented video frames
     let mut frame_reassembler = FrameReassembler::new();
+    if is_thunderbolt {
+        // Raw 4K frames are ~33MB with many fragments — allow more time
+        frame_reassembler.max_age_us = 500_000; // 500ms
+    }
 
     // Latency tracking - only track what we can actually measure locally
     let mut decode_latency_samples: Vec<u64> = Vec::with_capacity(60);

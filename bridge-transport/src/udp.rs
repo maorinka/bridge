@@ -21,13 +21,18 @@ pub struct UdpChannel {
 impl UdpChannel {
     /// Bind to a local port (server mode)
     pub async fn bind(port: u16, max_packet_size: usize) -> BridgeResult<Self> {
+        Self::bind_with_buffers(port, max_packet_size, 4 * 1024 * 1024).await
+    }
+
+    /// Bind to a local port with custom socket buffer sizes
+    pub async fn bind_with_buffers(port: u16, max_packet_size: usize, socket_buf_size: usize) -> BridgeResult<Self> {
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
         let socket = UdpSocket::bind(addr).await.map_err(|e| {
             BridgeError::Transport(format!("Failed to bind UDP socket on port {}: {}", port, e))
         })?;
 
         // Set socket options for low latency
-        Self::configure_socket(&socket)?;
+        Self::configure_socket(&socket, socket_buf_size)?;
 
         debug!("UDP channel bound to port {}", port);
 
@@ -43,6 +48,11 @@ impl UdpChannel {
 
     /// Connect to a remote address (client mode)
     pub async fn connect(remote_addr: SocketAddr, max_packet_size: usize) -> BridgeResult<Self> {
+        Self::connect_with_buffers(remote_addr, max_packet_size, 4 * 1024 * 1024).await
+    }
+
+    /// Connect to a remote address with custom socket buffer sizes
+    pub async fn connect_with_buffers(remote_addr: SocketAddr, max_packet_size: usize, socket_buf_size: usize) -> BridgeResult<Self> {
         // Bind to any available port
         let socket = UdpSocket::bind("0.0.0.0:0").await.map_err(|e| {
             BridgeError::Transport(format!("Failed to bind UDP socket: {}", e))
@@ -52,7 +62,7 @@ impl UdpChannel {
             BridgeError::Transport(format!("Failed to connect UDP socket: {}", e))
         })?;
 
-        Self::configure_socket(&socket)?;
+        Self::configure_socket(&socket, socket_buf_size)?;
 
         debug!("UDP channel connected to {}", remote_addr);
 
@@ -67,18 +77,18 @@ impl UdpChannel {
     }
 
     /// Configure socket for low latency and high throughput
-    fn configure_socket(socket: &UdpSocket) -> BridgeResult<()> {
+    fn configure_socket(socket: &UdpSocket, buf_size: usize) -> BridgeResult<()> {
         use std::os::unix::io::AsRawFd;
 
         let fd = socket.as_raw_fd();
-        let buf_size: libc::c_int = 4 * 1024 * 1024; // 4MB
+        let buf_size_c: libc::c_int = buf_size as libc::c_int;
 
         unsafe {
             let ret = libc::setsockopt(
                 fd,
                 libc::SOL_SOCKET,
                 libc::SO_SNDBUF,
-                &buf_size as *const _ as *const libc::c_void,
+                &buf_size_c as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
             if ret != 0 {
@@ -89,7 +99,7 @@ impl UdpChannel {
                 fd,
                 libc::SOL_SOCKET,
                 libc::SO_RCVBUF,
-                &buf_size as *const _ as *const libc::c_void,
+                &buf_size_c as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
             if ret != 0 {
@@ -97,7 +107,7 @@ impl UdpChannel {
             }
         }
 
-        debug!("Socket buffers configured: send=4MB, recv=4MB");
+        debug!("Socket buffers configured: send={}MB, recv={}MB", buf_size / (1024 * 1024), buf_size / (1024 * 1024));
         Ok(())
     }
 

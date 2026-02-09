@@ -198,48 +198,105 @@ async fn handle_client(
     // Get server's native display resolution BEFORE accepting
     let displays = get_displays();
     let main_display = displays.iter().find(|d| d.is_main).or(displays.first());
+    let has_physical_display = main_display.is_some();
     let (native_width, native_height) = main_display
         .map(|d| (d.width, d.height))
-        .unwrap_or((1920, 1080));
+        .unwrap_or((0, 0));
 
-    info!("Server native display: {}x{}", native_width, native_height);
+    if has_physical_display {
+        info!("Server native display: {}x{}", native_width, native_height);
+    } else {
+        info!("No physical display detected (headless mode)");
+    }
 
-    // Accept with config negotiation - create virtual display if client needs higher res
+    // For Thunderbolt: use larger packets and socket buffers
+    let mut config = config;
+    if is_thunderbolt {
+        config.max_packet_size = bridge_common::MAX_UDP_PACKET_SIZE_THUNDERBOLT;
+        config.send_buffer_size = 32 * 1024 * 1024; // 32MB
+        config.recv_buffer_size = 32 * 1024 * 1024;
+        info!("Thunderbolt: packet_size=65507, socket_buffers=32MB");
+    }
     let max_packet_size = config.max_packet_size;
 
-    // Virtual display disabled for now - using native capture
-    // let mut _virtual_display: Option<VirtualDisplay> = None;
-
+    // Accept with config negotiation
     let (mut conn, hello) = BridgeConnection::accept_with_negotiation(
         control_conn,
         config,
         server_name,
         |hello| {
-            // Client's requested resolution
-            hello.video_config.clone()
+            let mut cfg = hello.video_config.clone();
+            // For Thunderbolt connections, override codec to Raw
+            if is_thunderbolt {
+                cfg.codec = bridge_common::VideoCodec::Raw;
+                info!("Thunderbolt: overriding codec to Raw (uncompressed)");
+            }
+            cfg
         }
     ).await?;
 
     info!("Handshake complete with client: {}", hello.client_name);
 
-    // Get the negotiated video config (client's request)
+    // Get the negotiated video config
     let video_config = conn.video_config().cloned().unwrap();
 
-    // Use native resolution for now - virtual display is disabled until we fix the API
-    // TODO: Fix CGVirtualDisplay creation
-    let capture_width = native_width;
-    let capture_height = native_height;
-    let capture_display_id: Option<u32> = None;
+    // Determine capture resolution and display ID
+    let mut _virtual_display: Option<VirtualDisplay> = None;
+    let (capture_width, capture_height, capture_display_id) = if !has_physical_display {
+        // Headless: must create virtual display
+        let vd_width = if video_config.width > 0 { video_config.width } else { 3840 };
+        let vd_height = if video_config.height > 0 { video_config.height } else { 2160 };
 
-    if video_config.width > native_width || video_config.height > native_height {
-        info!("Client requested {}x{}, using native {}x{} (virtual display disabled)",
-              video_config.width, video_config.height, native_width, native_height);
-    }
+        if is_virtual_display_supported() {
+            match VirtualDisplay::new(vd_width, vd_height, video_config.fps) {
+                Ok(vd) => {
+                    let id = vd.display_id();
+                    let w = vd.width();
+                    let h = vd.height();
+                    info!("Virtual display created: {}x{} (ID={})", w, h, id);
+                    _virtual_display = Some(vd);
+                    (w, h, Some(id))
+                }
+                Err(e) => {
+                    error!("Failed to create virtual display: {}. No display available!", e);
+                    return Err(anyhow::anyhow!("No display available: headless and virtual display failed: {}", e));
+                }
+            }
+        } else {
+            error!("Headless mode requires macOS 14+ for virtual display support");
+            return Err(anyhow::anyhow!("No display available: headless and virtual display not supported"));
+        }
+    } else if video_config.width > native_width || video_config.height > native_height {
+        // Client wants higher res than native — try virtual display
+        if is_virtual_display_supported() {
+            match VirtualDisplay::new(video_config.width, video_config.height, video_config.fps) {
+                Ok(vd) => {
+                    let id = vd.display_id();
+                    let w = vd.width();
+                    let h = vd.height();
+                    info!("Virtual display created for upscale: {}x{} (ID={})", w, h, id);
+                    _virtual_display = Some(vd);
+                    (w, h, Some(id))
+                }
+                Err(e) => {
+                    warn!("Virtual display failed ({}), falling back to native {}x{}", e, native_width, native_height);
+                    (native_width, native_height, None)
+                }
+            }
+        } else {
+            info!("Client requested {}x{}, using native {}x{} (virtual display not supported)",
+                  video_config.width, video_config.height, native_width, native_height);
+            (native_width, native_height, None)
+        }
+    } else {
+        // Native display is fine
+        (native_width, native_height, None)
+    };
 
-    info!("Capture resolution: {}x{} @ {}fps", capture_width, capture_height, video_config.fps);
+    info!("Capture resolution: {}x{} @ {}fps, codec: {:?}", capture_width, capture_height, video_config.fps, video_config.codec);
 
     // Create capture config with actual capture resolution
-    let mut capture_config = CaptureConfig {
+    let capture_config = CaptureConfig {
         width: capture_width,
         height: capture_height,
         fps: video_config.fps,
@@ -259,10 +316,12 @@ async fn handle_client(
     };
     let mut capturer = ScreenCapturer::new(capture_config)?;
 
-    let mut encoder = if capture_video_config.codec != bridge_common::VideoCodec::Raw {
+    let is_raw_mode = capture_video_config.codec == bridge_common::VideoCodec::Raw;
+    let mut encoder = if !is_raw_mode {
         let encoder_config = EncoderConfig::from(&capture_video_config);
         Some(VideoEncoder::new(encoder_config)?)
     } else {
+        info!("Raw mode: skipping encoder (frames sent uncompressed)");
         None
     };
 
@@ -289,15 +348,16 @@ async fn handle_client(
     let fragment_size = max_packet_size - bridge_common::PacketHeader::SIZE - VideoFrameHeader::SIZE - 64;
 
     // Adaptive bitrate control state (based on packet loss only)
+    // Only relevant for encoded (non-raw) modes
     let initial_bitrate = video_config.bitrate;
     let min_bitrate = 15_000_000u32;  // 15 Mbps minimum (below this 4K is unwatchable)
     let max_bitrate = if is_thunderbolt {
-        200_000_000u32  // 200 Mbps for Thunderbolt
+        4_000_000_000u32  // 4 Gbps for Thunderbolt (H.265 fallback only)
     } else {
         80_000_000u32   // 80 Mbps for WiFi (802.11ac can handle this)
     };
     let mut current_bitrate = if is_thunderbolt {
-        initial_bitrate.max(80_000_000) // Start high for Thunderbolt
+        initial_bitrate.max(200_000_000) // Start high for Thunderbolt
     } else {
         initial_bitrate
     };
@@ -428,8 +488,8 @@ async fn handle_client(
                                     report.decode_latency_us,
                                     report.packet_loss * 100.0, report.jitter_us);
 
-                                // Simple adaptive bitrate based only on packet loss (which we can measure)
-                                // Don't use RTT since clocks aren't synchronized
+                                // Skip adaptive bitrate for raw mode (no encoder to adjust)
+                                if !is_raw_mode {
                                 if let Some(ref mut enc) = encoder {
                                     if last_bitrate_adjustment.elapsed() > bitrate_adjustment_interval {
                                         let new_bitrate = if report.packet_loss > 0.10 {
@@ -460,6 +520,7 @@ async fn handle_client(
                                         last_bitrate_adjustment = tokio::time::Instant::now();
                                     }
                                 }
+                                }
                             }
                             ControlMessage::Disconnect => {
                                 info!("Client disconnecting");
@@ -486,7 +547,52 @@ async fn handle_client(
                 let mut frames_this_tick = 0u32;
                 while let Some(frame) = capturer.recv_frame() {
                     frames_this_tick += 1;
-                    if let Some(ref mut enc) = encoder {
+
+                    if is_raw_mode {
+                        // Raw mode: send captured frame data directly (no encoding)
+                        if let Some(video_ch) = conn.video_channel() {
+                            let data = &frame.data;
+                            let fragment_count = data.len().div_ceil(fragment_size);
+
+                            debug!("Sending raw frame {} ({}x{}, {} bytes, {} fragments)",
+                                   video_frame_number, frame.width, frame.height, data.len(), fragment_count);
+
+                            for (i, chunk) in data.chunks(fragment_size).enumerate() {
+                                let frame_header = VideoFrameHeader {
+                                    frame_number: video_frame_number,
+                                    pts_us: frame.pts_us,
+                                    is_keyframe: true, // Every raw frame is independently decodable
+                                    frame_size: data.len() as u32,
+                                    fragment_index: i as u16,
+                                    fragment_count: fragment_count as u16,
+                                    width: capture_width,
+                                    height: capture_height,
+                                };
+
+                                let header_bytes = match bincode::serialize(&frame_header) {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        warn!("Failed to serialize frame header: {}", e);
+                                        continue;
+                                    }
+                                };
+
+                                let mut packet = Vec::with_capacity(header_bytes.len() + chunk.len());
+                                packet.extend_from_slice(&header_bytes);
+                                packet.extend_from_slice(chunk);
+
+                                if let Err(e) = video_ch.send(
+                                    bridge_common::PacketType::Video,
+                                    &packet,
+                                ).await {
+                                    warn!("Failed to send raw video fragment: {}", e);
+                                }
+                            }
+
+                            video_frame_number += 1;
+                        }
+                    } else if let Some(ref mut enc) = encoder {
+                        // Encoded mode: encode then send
                         debug!("Encoding frame {} ({}x{}, {} bytes)",
                                frame.frame_number, frame.width, frame.height, frame.data.len());
                         if let Err(e) = enc.encode(&frame) {

@@ -15,8 +15,11 @@ pub const MAGIC: [u8; 4] = *b"BRDG";
 /// Maximum packet size for UDP (MTU-safe)
 pub const MAX_UDP_PACKET_SIZE: usize = 1400;
 
+/// Maximum packet size for Thunderbolt UDP (loopback-like, no MTU fragmentation)
+pub const MAX_UDP_PACKET_SIZE_THUNDERBOLT: usize = 65507;
+
 /// Maximum video frame size (for allocation)
-pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024; // 16MB for 4K frames
+pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024; // 64MB for raw 4K BGRA frames
 
 // ============================================================================
 // Packet Header
