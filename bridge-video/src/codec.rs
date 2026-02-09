@@ -68,6 +68,8 @@ pub struct EncoderConfig {
     pub low_latency: bool,
     /// Enable real-time encoding
     pub realtime: bool,
+    /// Maximum quality mode (for high-bandwidth connections like Thunderbolt)
+    pub max_quality: bool,
 }
 
 impl Default for EncoderConfig {
@@ -81,6 +83,7 @@ impl Default for EncoderConfig {
             keyframe_interval: 60, // 1 second at 60fps
             low_latency: true,
             realtime: true,
+            max_quality: false,
         }
     }
 }
@@ -276,11 +279,12 @@ impl VideoEncoder {
                 }
             }
 
-            // Set profile level for better compatibility
-            let profile = match config.codec {
-                VideoCodec::H265 => kVTProfileLevel_HEVC_Main_AutoLevel,
-                VideoCodec::H264 => kVTProfileLevel_H264_Main_AutoLevel,
-                VideoCodec::Raw => ptr::null(),
+            // Set profile level — use Main10 for max quality (10-bit color)
+            let profile = match (config.codec, config.max_quality) {
+                (VideoCodec::H265, true) => kVTProfileLevel_HEVC_Main10_AutoLevel,
+                (VideoCodec::H265, false) => kVTProfileLevel_HEVC_Main_AutoLevel,
+                (VideoCodec::H264, _) => kVTProfileLevel_H264_Main_AutoLevel,
+                (VideoCodec::Raw, _) => ptr::null(),
             };
             if !profile.is_null() {
                 let status = VTSessionSetProperty(
@@ -292,9 +296,50 @@ impl VideoEncoder {
                     warn!("Failed to set profile level: {}", status);
                 }
             }
+
+            // For max quality mode: set Quality property and allow high burst rates
+            if config.max_quality {
+                // Quality = 1.0 (maximum)
+                let quality_num = cf_number_create_f64(1.0);
+                let status = VTSessionSetProperty(
+                    encoder.session as *mut c_void,
+                    kVTCompressionPropertyKey_Quality,
+                    quality_num,
+                );
+                CFRelease(quality_num);
+                if status != NO_ERR {
+                    warn!("Failed to set quality: {}", status);
+                } else {
+                    info!("  Quality: maximum (1.0)");
+                }
+
+                // DataRateLimits: allow burst up to 4x average bitrate per second
+                let burst_limit = config.bitrate as i64 * 4;
+                let one_second: i64 = 1;
+                let limits = [burst_limit, one_second];
+                let limits_data = CFDataCreate(
+                    kCFAllocatorDefault,
+                    limits.as_ptr() as *const u8,
+                    (limits.len() * std::mem::size_of::<i64>()) as isize,
+                );
+                if !limits_data.is_null() {
+                    let status = VTSessionSetProperty(
+                        encoder.session as *mut c_void,
+                        kVTCompressionPropertyKey_DataRateLimits,
+                        limits_data as CFTypeRef,
+                    );
+                    CFRelease(limits_data as CFTypeRef);
+                    if status != NO_ERR {
+                        warn!("Failed to set data rate limits: {}", status);
+                    } else {
+                        info!("  Data rate limit: {} Mbps burst", burst_limit / 1_000_000);
+                    }
+                }
+            }
         }
 
-        info!("VideoToolbox encoder configured for low-latency streaming");
+        info!("VideoToolbox encoder configured for {} streaming",
+              if config.max_quality { "max-quality" } else { "low-latency" });
 
         Ok(encoder)
     }

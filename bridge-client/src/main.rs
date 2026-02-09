@@ -352,7 +352,7 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
         fps: 60,
         codec: bridge_common::VideoCodec::H265,
         bitrate: if is_thunderbolt {
-            200_000_000 // 200 Mbps - near-lossless for Thunderbolt
+            500_000_000 // 500 Mbps - near-lossless for Thunderbolt
         } else {
             60_000_000 // 60 Mbps - good quality for 4K60 H.265
         },

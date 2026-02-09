@@ -100,6 +100,8 @@ pub const K_VT_H264_ENTROPY_MODE_CABAC: CFStringRef = ptr::null();
 #[link(name = "VideoToolbox", kind = "framework")]
 extern "C" {
     pub static kVTCompressionPropertyKey_AverageBitRate: CFStringRef;
+    pub static kVTCompressionPropertyKey_DataRateLimits: CFStringRef;
+    pub static kVTCompressionPropertyKey_Quality: CFStringRef;
     pub static kVTCompressionPropertyKey_ExpectedFrameRate: CFStringRef;
     pub static kVTCompressionPropertyKey_RealTime: CFStringRef;
     pub static kVTCompressionPropertyKey_AllowFrameReordering: CFStringRef;
@@ -107,6 +109,7 @@ extern "C" {
     pub static kVTCompressionPropertyKey_MaxFrameDelayCount: CFStringRef;
     pub static kVTCompressionPropertyKey_ProfileLevel: CFStringRef;
     pub static kVTProfileLevel_HEVC_Main_AutoLevel: CFStringRef;
+    pub static kVTProfileLevel_HEVC_Main10_AutoLevel: CFStringRef;
     pub static kVTProfileLevel_H264_Main_AutoLevel: CFStringRef;
 }
 
@@ -140,6 +143,12 @@ extern "C" {
         the_type: i32,
         value_ptr: *const c_void,
     ) -> CFNumberRef;
+
+    pub fn CFDataCreate(
+        allocator: CFAllocatorRef,
+        bytes: *const u8,
+        length: isize,
+    ) -> *mut c_void;
 }
 
 // CoreVideo pixel buffer keys
@@ -412,6 +421,7 @@ pub const K_CM_VIDEO_CODEC_TYPE_HEVC: u32 = 0x68766331; // 'hvc1'
 
 /// CFNumber type constants
 pub const K_CF_NUMBER_SINT64_TYPE: i32 = 4; // kCFNumberSInt64Type
+pub const K_CF_NUMBER_FLOAT64_TYPE: i32 = 6; // kCFNumberFloat64Type
 
 /// Create a CFNumber from an i64 value
 pub fn cf_number_create_i64(value: i64) -> CFTypeRef {
@@ -420,6 +430,17 @@ pub fn cf_number_create_i64(value: i64) -> CFTypeRef {
             kCFAllocatorDefault,
             K_CF_NUMBER_SINT64_TYPE,
             &value as *const i64 as *const c_void,
+        )
+    }
+}
+
+/// Create a CFNumber from an f64 value
+pub fn cf_number_create_f64(value: f64) -> CFTypeRef {
+    unsafe {
+        CFNumberCreate(
+            kCFAllocatorDefault,
+            K_CF_NUMBER_FLOAT64_TYPE,
+            &value as *const f64 as *const c_void,
         )
     }
 }

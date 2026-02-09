@@ -231,8 +231,8 @@ async fn handle_client(
             // H.265 at 200 Mbps looks near-perfect and fits easily
             if is_thunderbolt {
                 cfg.codec = bridge_common::VideoCodec::H265;
-                cfg.bitrate = 200_000_000; // 200 Mbps - near-lossless for Thunderbolt
-                info!("Thunderbolt: using H.265 at 200 Mbps (high quality)");
+                cfg.bitrate = 500_000_000; // 500 Mbps - near-lossless for Thunderbolt
+                info!("Thunderbolt: using H.265 at 500 Mbps (max quality)");
             }
             cfg
         }
@@ -316,7 +316,11 @@ async fn handle_client(
 
     let is_raw_mode = capture_video_config.codec == bridge_common::VideoCodec::Raw;
     let mut encoder = if !is_raw_mode {
-        let encoder_config = EncoderConfig::from(&capture_video_config);
+        let mut encoder_config = EncoderConfig::from(&capture_video_config);
+        if is_thunderbolt {
+            encoder_config.max_quality = true;
+            info!("Thunderbolt: encoder set to max quality mode");
+        }
         Some(VideoEncoder::new(encoder_config)?)
     } else {
         info!("Raw mode: skipping encoder (frames sent uncompressed)");
