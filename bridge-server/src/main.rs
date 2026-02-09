@@ -252,24 +252,24 @@ async fn handle_client(
         || video_config.width != native_width
         || video_config.height != native_height;
 
-    let (capture_width, capture_height, capture_display_id) = if need_virtual_display {
+    // Try to create virtual display; capture_display_id is used by CGDisplayStream
+    let capture_display_id = if need_virtual_display {
         let vd_width = if video_config.width > 0 { video_config.width } else { 3840 };
         let vd_height = if video_config.height > 0 { video_config.height } else { 2160 };
 
         if is_virtual_display_supported() {
             match VirtualDisplay::new(vd_width, vd_height, video_config.fps) {
                 Ok(vd) => {
+                    info!("Virtual display created: {}x{} (ID={})", vd.width(), vd.height(), vd.display_id());
                     let id = vd.display_id();
-                    let w = vd.width();
-                    let h = vd.height();
-                    info!("Virtual display created: {}x{} (ID={})", w, h, id);
                     _virtual_display = Some(vd);
-                    (w, h, Some(id))
+                    Some(id)
                 }
                 Err(e) => {
                     if has_physical_display {
-                        warn!("Virtual display failed ({}), falling back to native {}x{}", e, native_width, native_height);
-                        (native_width, native_height, None)
+                        warn!("Virtual display failed ({}), using native display (CGDisplayStream will scale to {}x{})",
+                              e, video_config.width, video_config.height);
+                        None
                     } else {
                         error!("Failed to create virtual display: {}. No display available!", e);
                         return Err(anyhow::anyhow!("No display available: {}", e));
@@ -277,16 +277,19 @@ async fn handle_client(
                 }
             }
         } else if has_physical_display {
-            info!("Virtual display not supported, using native {}x{}", native_width, native_height);
-            (native_width, native_height, None)
+            info!("Virtual display not supported, using native display");
+            None
         } else {
             error!("Headless mode requires macOS 14+ for virtual display support");
             return Err(anyhow::anyhow!("No display available: virtual display not supported"));
         }
     } else {
-        // Native display matches requested resolution
-        (native_width, native_height, None)
+        None
     };
+
+    // Always capture at the negotiated resolution — CGDisplayStream handles scaling
+    let capture_width = video_config.width;
+    let capture_height = video_config.height;
 
     info!("Capture resolution: {}x{} @ {}fps, codec: {:?}", capture_width, capture_height, video_config.fps, video_config.codec);
 
