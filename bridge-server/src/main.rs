@@ -548,6 +548,12 @@ async fn handle_client(
             }
 
             _ = tokio::time::sleep(std::time::Duration::from_millis(1)), if is_streaming => {
+                // Check if capture was stopped externally (e.g. display disconnected)
+                if capturer.is_stopped() {
+                    error!("Display was disconnected — stopping stream");
+                    break;
+                }
+
                 // Process video frames
                 let mut frames_this_tick = 0u32;
                 while let Some(frame) = capturer.recv_frame() {

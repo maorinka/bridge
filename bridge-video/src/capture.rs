@@ -80,6 +80,7 @@ impl From<&VideoConfig> for CaptureConfig {
 struct CaptureContext {
     frame_tx: Sender<CapturedFrame>,
     frame_count: Arc<AtomicU64>,
+    is_stopped: Arc<AtomicBool>,
     width: u32,
     height: u32,
 }
@@ -91,6 +92,7 @@ pub struct ScreenCapturer {
     frame_rx: Receiver<CapturedFrame>,
     frame_count: Arc<AtomicU64>,
     is_running: Arc<AtomicBool>,
+    is_stopped: Arc<AtomicBool>,
     stream: Option<CGDisplayStreamRef>,
     queue: Option<DispatchQueueRef>,
     /// Arc-wrapped context - the block callback holds a clone, preventing use-after-free
@@ -111,6 +113,7 @@ impl ScreenCapturer {
             frame_rx,
             frame_count: Arc::new(AtomicU64::new(0)),
             is_running: Arc::new(AtomicBool::new(false)),
+            is_stopped: Arc::new(AtomicBool::new(false)),
             stream: None,
             queue: None,
             context: None,
@@ -184,6 +187,7 @@ impl ScreenCapturer {
         let context = Arc::new(CaptureContext {
             frame_tx: self.frame_tx.clone(),
             frame_count: self.frame_count.clone(),
+            is_stopped: self.is_stopped.clone(),
             width: target_width,
             height: target_height,
         });
@@ -247,9 +251,12 @@ impl ScreenCapturer {
         self.is_running.store(false, Ordering::SeqCst);
 
         // Stop and release the stream
+        // Skip CGDisplayStreamStop if already stopped externally (display disconnect)
         if let Some(stream) = self.stream.take() {
             unsafe {
-                CGDisplayStreamStop(stream);
+                if !self.is_stopped.load(Ordering::SeqCst) {
+                    CGDisplayStreamStop(stream);
+                }
                 CFRelease(stream as CFTypeRef);
             }
         }
@@ -265,6 +272,11 @@ impl ScreenCapturer {
         self.context.take();
 
         Ok(())
+    }
+
+    /// Check if the capture stream was stopped externally (e.g. display disconnected)
+    pub fn is_stopped(&self) -> bool {
+        self.is_stopped.load(Ordering::SeqCst)
     }
 
     /// Get the next captured frame
@@ -395,7 +407,8 @@ fn create_capture_block(context: Arc<CaptureContext>) -> *const c_void {
                 debug!("Display blanked");
             }
             CGDisplayStreamFrameStatus::Stopped => {
-                debug!("CGDisplayStream stopped");
+                warn!("CGDisplayStream stopped (display disconnected or removed)");
+                context.is_stopped.store(true, Ordering::SeqCst);
             }
         }
     };
