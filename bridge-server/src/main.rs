@@ -602,13 +602,13 @@ async fn handle_client(
 
                 // Process video frames
                 let mut frames_this_tick = 0u32;
-                while let Some(frame) = capturer.recv_frame() {
+                while let Some(mut frame) = capturer.recv_frame() {
                     frames_this_tick += 1;
 
                     if is_raw_mode {
                         // Raw mode: send captured frame data directly (no encoding)
                         if let Some(video_ch) = conn.video_channel() {
-                            let data = &frame.data;
+                            let data = frame.read_pixel_data();
                             let fragment_count = data.len().div_ceil(fragment_size);
 
                             debug!("Sending raw frame {} ({}x{}, {} bytes, {} fragments)",
@@ -655,9 +655,9 @@ async fn handle_client(
                         }
                     } else if let Some(ref mut enc) = encoder {
                         // Encoded mode: encode then send
-                        debug!("Encoding frame {} ({}x{}, {} bytes)",
-                               frame.frame_number, frame.width, frame.height, frame.data.len());
-                        if let Err(e) = enc.encode(&frame) {
+                        debug!("Encoding frame {} ({}x{}, IOSurface={})",
+                               frame.frame_number, frame.width, frame.height, frame.io_surface.is_some());
+                        if let Err(e) = enc.encode(&mut frame) {
                             warn!("Encode error: {}", e);
                         }
 

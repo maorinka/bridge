@@ -33,6 +33,53 @@ pub struct CapturedFrame {
     pub io_surface: Option<IOSurfaceRef>,
 }
 
+impl CapturedFrame {
+    /// Read pixel data from the IOSurface (locks, copies, unlocks).
+    /// Used for raw mode where the actual pixel bytes are needed.
+    /// In the zero-copy path, `data` is empty and this reads from the IOSurface.
+    pub fn read_pixel_data(&self) -> Vec<u8> {
+        if !self.data.is_empty() {
+            return self.data.clone();
+        }
+
+        if let Some(surface) = self.io_surface {
+            unsafe {
+                let lock_result = IOSurfaceLock(surface, 1, std::ptr::null_mut());
+                if lock_result != 0 {
+                    warn!("Failed to lock IOSurface for read: {}", lock_result);
+                    return Vec::new();
+                }
+
+                let base_addr = IOSurfaceGetBaseAddress(surface);
+                let data_size = (self.bytes_per_row * self.height) as usize;
+
+                let data = if !base_addr.is_null() {
+                    let slice = std::slice::from_raw_parts(base_addr as *const u8, data_size);
+                    slice.to_vec()
+                } else {
+                    vec![0u8; data_size]
+                };
+
+                IOSurfaceUnlock(surface, 1, std::ptr::null_mut());
+                data
+            }
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+impl Drop for CapturedFrame {
+    fn drop(&mut self) {
+        if let Some(surface) = self.io_surface.take() {
+            unsafe {
+                IOSurfaceDecrementUseCount(surface);
+                CFRelease(surface as CFTypeRef);
+            }
+        }
+    }
+}
+
 unsafe impl Send for CapturedFrame {}
 
 /// Screen capture configuration
@@ -375,47 +422,36 @@ fn create_capture_block(context: Arc<CaptureContext>) -> *const c_void {
                 // Access context through the Arc - safe because Arc keeps it alive
                 let frame_num = context.frame_count.fetch_add(1, Ordering::SeqCst);
 
-                // Lock the IOSurface to read pixel data
-                let lock_result = unsafe { IOSurfaceLock(surface, 1, std::ptr::null_mut()) }; // Read-only lock
-                if lock_result != 0 {
-                    warn!("Failed to lock IOSurface: {}", lock_result);
-                    return;
-                }
-
-                // Get surface properties
+                // Get surface properties (metadata reads, no lock needed)
                 let width = unsafe { IOSurfaceGetWidth(surface) } as u32;
                 let height = unsafe { IOSurfaceGetHeight(surface) } as u32;
                 let bytes_per_row = unsafe { IOSurfaceGetBytesPerRow(surface) } as u32;
-                let base_addr = unsafe { IOSurfaceGetBaseAddress(surface) };
 
-                // Copy pixel data from IOSurface
-                let data_size = (bytes_per_row * height) as usize;
-                let data = if !base_addr.is_null() {
-                    let slice = unsafe { std::slice::from_raw_parts(base_addr as *const u8, data_size) };
-                    slice.to_vec()
-                } else {
-                    vec![0u8; data_size]
-                };
+                // Zero-copy: retain the IOSurface for use outside this callback.
+                // CFRetain keeps the object alive beyond the callback;
+                // IncrementUseCount prevents CGDisplayStream from reusing this buffer.
+                unsafe {
+                    CFRetain(surface as CFTypeRef);
+                    IOSurfaceIncrementUseCount(surface);
+                }
 
-                // Unlock the IOSurface
-                unsafe { IOSurfaceUnlock(surface, 1, std::ptr::null_mut()) };
-
-                // Create the captured frame
+                // Create the captured frame with IOSurface reference (no pixel copy)
                 let frame = CapturedFrame {
-                    data,
+                    data: Vec::new(),
                     width,
                     height,
                     bytes_per_row,
                     pts_us: display_time / 1000, // Convert from nanoseconds to microseconds
                     frame_number: frame_num,
-                    io_surface: None, // We don't retain the IOSurface since we copied the data
+                    io_surface: Some(surface),
                 };
 
                 // Send frame (non-blocking)
+                // If channel is full, frame is dropped immediately, which releases the IOSurface
                 match context.frame_tx.try_send(frame) {
                     Ok(()) => {
-                        debug!("Frame {} sent to channel ({}x{}, {} bytes)",
-                               frame_num, width, height, data_size);
+                        debug!("Frame {} sent to channel ({}x{}, zero-copy IOSurface)",
+                               frame_num, width, height);
                     }
                     Err(e) => {
                         warn!("Frame {} dropped: {}", frame_num, e);
@@ -642,7 +678,7 @@ mod tests {
             frame_count += 1;
             assert!(frame.width > 0, "Invalid frame width");
             assert!(frame.height > 0, "Invalid frame height");
-            assert!(!frame.data.is_empty(), "Frame data is empty");
+            assert!(frame.io_surface.is_some(), "Frame should have IOSurface (zero-copy)");
 
             if frame_count >= 3 {
                 break;

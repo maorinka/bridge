@@ -338,6 +338,13 @@ extern "C" {
 
     pub fn CVPixelBufferRelease(pixel_buffer: CVPixelBufferRef);
     pub fn CVPixelBufferRetain(pixel_buffer: CVPixelBufferRef) -> CVPixelBufferRef;
+
+    pub fn CVPixelBufferCreateWithIOSurface(
+        allocator: CFAllocatorRef,
+        surface: IOSurfaceRef,
+        pixel_buffer_attributes: CFDictionaryRef,
+        pixel_buffer_out: *mut CVPixelBufferRef,
+    ) -> OSStatus;
 }
 
 #[link(name = "VideoToolbox", kind = "framework")]
@@ -417,6 +424,8 @@ extern "C" {
     pub fn IOSurfaceLock(surface: IOSurfaceRef, options: u32, seed: *mut u32) -> OSStatus;
     pub fn IOSurfaceUnlock(surface: IOSurfaceRef, options: u32, seed: *mut u32) -> OSStatus;
     pub fn IOSurfaceGetBaseAddress(surface: IOSurfaceRef) -> *mut c_void;
+    pub fn IOSurfaceIncrementUseCount(surface: IOSurfaceRef);
+    pub fn IOSurfaceDecrementUseCount(surface: IOSurfaceRef);
 }
 
 // Codec type constants

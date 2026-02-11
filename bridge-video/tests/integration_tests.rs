@@ -55,7 +55,7 @@ fn test_encode_synthetic_frame_h264() {
         }
     }
 
-    let frame = CapturedFrame {
+    let mut frame = CapturedFrame {
         data,
         width: 256,
         height: 256,
@@ -66,7 +66,7 @@ fn test_encode_synthetic_frame_h264() {
     };
 
     // Encode
-    encoder.encode(&frame).expect("Encode failed");
+    encoder.encode(&mut frame).expect("Encode failed");
     encoder.flush().expect("Flush failed");
 
     // Wait and collect output
@@ -105,7 +105,7 @@ fn test_encode_synthetic_frame_h265() {
     // Create a solid color test frame
     let data = vec![100u8; 256 * 256 * 4];
 
-    let frame = CapturedFrame {
+    let mut frame = CapturedFrame {
         data,
         width: 256,
         height: 256,
@@ -115,7 +115,7 @@ fn test_encode_synthetic_frame_h265() {
         io_surface: None,
     };
 
-    encoder.encode(&frame).expect("Encode failed");
+    encoder.encode(&mut frame).expect("Encode failed");
     encoder.flush().expect("Flush failed");
 
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -168,7 +168,7 @@ fn test_encode_multiple_frames_temporal() {
             }
         }
 
-        let frame = CapturedFrame {
+        let mut frame = CapturedFrame {
             data,
             width: 128,
             height: 128,
@@ -178,7 +178,7 @@ fn test_encode_multiple_frames_temporal() {
             io_surface: None,
         };
 
-        encoder.encode(&frame).expect("Encode failed");
+        encoder.encode(&mut frame).expect("Encode failed");
     }
 
     encoder.flush().expect("Flush failed");
@@ -339,9 +339,9 @@ async fn test_capture_to_encode_pipeline() {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Process captured frames
-        while let Some(frame) = capturer.recv_frame() {
+        while let Some(mut frame) = capturer.recv_frame() {
             captured_count += 1;
-            if let Err(e) = encoder.encode(&frame) {
+            if let Err(e) = encoder.encode(&mut frame) {
                 eprintln!("Encode error: {}", e);
             }
         }
@@ -434,7 +434,7 @@ fn test_encoder_frame_counting() {
 
     // Encode a few frames
     for i in 0..3 {
-        let frame = CapturedFrame {
+        let mut frame = CapturedFrame {
             data: vec![0u8; 128 * 128 * 4],
             width: 128,
             height: 128,
@@ -443,7 +443,7 @@ fn test_encoder_frame_counting() {
             frame_number: i,
             io_surface: None,
         };
-        encoder.encode(&frame).expect("Encode failed");
+        encoder.encode(&mut frame).expect("Encode failed");
     }
 
     encoder.flush().expect("Flush failed");

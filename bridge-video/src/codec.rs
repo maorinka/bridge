@@ -341,62 +341,93 @@ impl VideoEncoder {
     }
 
     /// Encode a captured frame
-    pub fn encode(&mut self, frame: &CapturedFrame) -> BridgeResult<()> {
+    ///
+    /// If the frame has an IOSurface, this takes ownership of it (sets it to None)
+    /// and passes it to VideoToolbox. The encoder output callback releases it when
+    /// VT confirms it's done reading, preventing CGDisplayStream from recycling
+    /// the buffer while VT is still accessing it.
+    pub fn encode(&mut self, frame: &mut CapturedFrame) -> BridgeResult<()> {
         if self.session.is_null() {
             return Err(BridgeError::Video("Encoder not initialized".into()));
         }
 
-        // Create CVPixelBuffer from frame data
         let mut pixel_buffer: CVPixelBufferRef = ptr::null_mut();
+        // Take IOSurface ownership from the frame — encoder pipeline manages its lifetime
+        let owned_surface = frame.io_surface.take();
 
         unsafe {
-            // Create a CVPixelBuffer with the frame dimensions
-            let status = CVPixelBufferCreate(
-                kCFAllocatorDefault,
-                frame.width as usize,
-                frame.height as usize,
-                K_CV_PIXEL_FORMAT_TYPE_32_BGRA,
-                ptr::null(),
-                &mut pixel_buffer,
-            );
+            if let Some(surface) = owned_surface {
+                // Zero-copy path: create CVPixelBuffer backed by the IOSurface directly.
+                // VideoToolbox reads from the IOSurface via GPU/DMA — no CPU copy.
+                let status = CVPixelBufferCreateWithIOSurface(
+                    kCFAllocatorDefault,
+                    surface,
+                    ptr::null(),
+                    &mut pixel_buffer,
+                );
 
-            if status != NO_ERR || pixel_buffer.is_null() {
-                return Err(BridgeError::Video(format!(
-                    "Failed to create pixel buffer: {}",
-                    status
-                )));
-            }
+                if status != NO_ERR || pixel_buffer.is_null() {
+                    // Put it back so Drop can release it
+                    frame.io_surface = Some(surface);
+                    return Err(BridgeError::Video(format!(
+                        "Failed to create pixel buffer from IOSurface: {}",
+                        status
+                    )));
+                }
+            } else {
+                // Fallback path: create CVPixelBuffer and copy data (for tests)
+                let status = CVPixelBufferCreate(
+                    kCFAllocatorDefault,
+                    frame.width as usize,
+                    frame.height as usize,
+                    K_CV_PIXEL_FORMAT_TYPE_32_BGRA,
+                    ptr::null(),
+                    &mut pixel_buffer,
+                );
 
-            // Lock and copy data into the pixel buffer
-            let lock_status = CVPixelBufferLockBaseAddress(pixel_buffer, 0);
-            if lock_status != NO_ERR {
-                CVPixelBufferRelease(pixel_buffer);
-                return Err(BridgeError::Video("Failed to lock pixel buffer".into()));
-            }
+                if status != NO_ERR || pixel_buffer.is_null() {
+                    return Err(BridgeError::Video(format!(
+                        "Failed to create pixel buffer: {}",
+                        status
+                    )));
+                }
 
-            let dest_base = CVPixelBufferGetBaseAddress(pixel_buffer);
-            let dest_bytes_per_row = CVPixelBufferGetBytesPerRow(pixel_buffer);
+                let lock_status = CVPixelBufferLockBaseAddress(pixel_buffer, 0);
+                if lock_status != NO_ERR {
+                    CVPixelBufferRelease(pixel_buffer);
+                    return Err(BridgeError::Video("Failed to lock pixel buffer".into()));
+                }
 
-            if !dest_base.is_null() {
-                // Copy row by row in case of different row strides
-                let src_bytes_per_row = frame.bytes_per_row as usize;
-                let copy_bytes_per_row = src_bytes_per_row.min(dest_bytes_per_row);
+                let dest_base = CVPixelBufferGetBaseAddress(pixel_buffer);
+                let dest_bytes_per_row = CVPixelBufferGetBytesPerRow(pixel_buffer);
 
-                for y in 0..frame.height as usize {
-                    let src_offset = y * src_bytes_per_row;
-                    let dest_offset = y * dest_bytes_per_row;
+                if !dest_base.is_null() {
+                    let src_bytes_per_row = frame.bytes_per_row as usize;
+                    let copy_bytes_per_row = src_bytes_per_row.min(dest_bytes_per_row);
 
-                    if src_offset + copy_bytes_per_row <= frame.data.len() {
-                        ptr::copy_nonoverlapping(
-                            frame.data.as_ptr().add(src_offset),
-                            (dest_base as *mut u8).add(dest_offset),
-                            copy_bytes_per_row,
-                        );
+                    for y in 0..frame.height as usize {
+                        let src_offset = y * src_bytes_per_row;
+                        let dest_offset = y * dest_bytes_per_row;
+
+                        if src_offset + copy_bytes_per_row <= frame.data.len() {
+                            ptr::copy_nonoverlapping(
+                                frame.data.as_ptr().add(src_offset),
+                                (dest_base as *mut u8).add(dest_offset),
+                                copy_bytes_per_row,
+                            );
+                        }
                     }
                 }
+
+                CVPixelBufferUnlockBaseAddress(pixel_buffer, 0);
             }
 
-            CVPixelBufferUnlockBaseAddress(pixel_buffer, 0);
+            // Pass IOSurface (if any) as source_frame_ref_con so the encoder output
+            // callback can release it after VT confirms it's done reading.
+            let source_ref_con = match owned_surface {
+                Some(surface) => surface, // IOSurfaceRef is *mut c_void
+                None => ptr::null_mut(),
+            };
 
             // Encode the frame
             let pts = CMTimeStruct::new(frame.pts_us as i64, 1_000_000);
@@ -408,14 +439,19 @@ impl VideoEncoder {
                 pts,
                 duration,
                 ptr::null(),
-                ptr::null_mut(),
+                source_ref_con,
                 ptr::null_mut(),
             );
 
-            // Release the pixel buffer (encoder will retain if needed)
+            // Release the pixel buffer (encoder retains internally if needed)
             CVPixelBufferRelease(pixel_buffer);
 
             if encode_status != NO_ERR {
+                // Encoding failed — release the IOSurface ourselves since the callback won't fire
+                if let Some(surface) = owned_surface {
+                    IOSurfaceDecrementUseCount(surface);
+                    CFRelease(surface as CFTypeRef);
+                }
                 return Err(BridgeError::Video(format!(
                     "Encode failed: {}",
                     encode_status
@@ -526,11 +562,21 @@ impl Drop for VideoEncoder {
 /// Encoder output callback - called by VideoToolbox when a frame is encoded
 extern "C" fn encoder_output_callback(
     output_callback_ref_con: *mut c_void,
-    _source_frame_ref_con: *mut c_void,
+    source_frame_ref_con: *mut c_void,
     status: OSStatus,
     _info_flags: u32,
     sample_buffer: CMSampleBufferRef,
 ) {
+    // Release the IOSurface now that VT is done reading from it.
+    // This is passed via source_frame_ref_con from encode() for zero-copy frames.
+    if !source_frame_ref_con.is_null() {
+        unsafe {
+            let surface: IOSurfaceRef = source_frame_ref_con;
+            IOSurfaceDecrementUseCount(surface);
+            CFRelease(surface as CFTypeRef);
+        }
+    }
+
     if status != NO_ERR || sample_buffer.is_null() {
         if status != NO_ERR {
             warn!("Encoder callback received error status: {}", status);
@@ -1571,7 +1617,7 @@ mod tests {
         let mut encoder = VideoEncoder::new(config).expect("Failed to create encoder");
 
         // Create a test frame
-        let frame = CapturedFrame {
+        let mut frame = CapturedFrame {
             data: vec![128u8; 320 * 240 * 4], // Gray frame
             width: 320,
             height: 240,
@@ -1581,7 +1627,7 @@ mod tests {
             io_surface: None,
         };
 
-        let result = encoder.encode(&frame);
+        let result = encoder.encode(&mut frame);
         assert!(result.is_ok(), "Encode failed: {:?}", result.err());
 
         // Flush to ensure output
@@ -1614,7 +1660,7 @@ mod tests {
 
         // Encode several frames
         for i in 0..5 {
-            let frame = CapturedFrame {
+            let mut frame = CapturedFrame {
                 data: vec![(i * 50) as u8; 320 * 240 * 4],
                 width: 320,
                 height: 240,
@@ -1624,7 +1670,7 @@ mod tests {
                 io_surface: None,
             };
 
-            encoder.encode(&frame).expect("Encode failed");
+            encoder.encode(&mut frame).expect("Encode failed");
         }
 
         encoder.flush().expect("Flush failed");
