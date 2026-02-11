@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use tracing::{debug, info, warn};
 
+use crate::sck_capture::SckBackend;
 use crate::sys::*;
 
 /// Captured frame with metadata
@@ -132,7 +133,19 @@ struct CaptureContext {
     height: u32,
 }
 
-/// Screen capturer using CGDisplayStream
+/// Active capture backend
+enum CaptureBackend {
+    /// Modern ScreenCaptureKit (macOS 12.3+)
+    Sck(SckBackend),
+    /// Legacy CGDisplayStream fallback
+    CgDisplayStream {
+        stream: CGDisplayStreamRef,
+        queue: DispatchQueueRef,
+        context: Arc<CaptureContext>,
+    },
+}
+
+/// Screen capturer — tries ScreenCaptureKit first, falls back to CGDisplayStream
 pub struct ScreenCapturer {
     config: CaptureConfig,
     frame_tx: Sender<CapturedFrame>,
@@ -140,10 +153,7 @@ pub struct ScreenCapturer {
     frame_count: Arc<AtomicU64>,
     is_running: Arc<AtomicBool>,
     is_stopped: Arc<AtomicBool>,
-    stream: Option<CGDisplayStreamRef>,
-    queue: Option<DispatchQueueRef>,
-    /// Arc-wrapped context - the block callback holds a clone, preventing use-after-free
-    context: Option<Arc<CaptureContext>>,
+    backend: Option<CaptureBackend>,
 }
 
 unsafe impl Send for ScreenCapturer {}
@@ -161,9 +171,7 @@ impl ScreenCapturer {
             frame_count: Arc::new(AtomicU64::new(0)),
             is_running: Arc::new(AtomicBool::new(false)),
             is_stopped: Arc::new(AtomicBool::new(false)),
-            stream: None,
-            queue: None,
-            context: None,
+            backend: None,
         })
     }
 
@@ -188,6 +196,8 @@ impl ScreenCapturer {
     }
 
     /// Start capturing frames
+    ///
+    /// Tries ScreenCaptureKit first (modern, lower latency), falls back to CGDisplayStream.
     pub async fn start(&mut self) -> BridgeResult<()> {
         if self.is_running.load(Ordering::SeqCst) {
             return Ok(());
@@ -195,6 +205,29 @@ impl ScreenCapturer {
 
         info!("Starting screen capture at {}fps", self.config.fps);
 
+        // Try ScreenCaptureKit first (macOS 12.3+)
+        match SckBackend::start(
+            &self.config,
+            self.frame_tx.clone(),
+            self.frame_count.clone(),
+            self.is_stopped.clone(),
+        ) {
+            Ok(sck) => {
+                self.backend = Some(CaptureBackend::Sck(sck));
+                self.is_running.store(true, Ordering::SeqCst);
+                return Ok(());
+            }
+            Err(e) => {
+                warn!("ScreenCaptureKit failed ({}), falling back to CGDisplayStream", e);
+            }
+        }
+
+        // Fallback: CGDisplayStream
+        self.start_cgdisplaystream().await
+    }
+
+    /// Start capture using legacy CGDisplayStream
+    async fn start_cgdisplaystream(&mut self) -> BridgeResult<()> {
         // Get display ID
         let display_id = self.config.display_id.unwrap_or_else(|| unsafe {
             CGMainDisplayID()
@@ -218,7 +251,7 @@ impl ScreenCapturer {
         let target_width = if self.config.width > 0 { self.config.width } else { native_width };
         let target_height = if self.config.height > 0 { self.config.height } else { native_height };
 
-        info!("Display {}x{}, capturing at {}x{}", native_width, native_height, target_width, target_height);
+        info!("CGDisplayStream: display {}x{}, capturing at {}x{}", native_width, native_height, target_width, target_height);
 
         // Create dispatch queue for callbacks
         let queue_label = CString::new("com.bridge.capture").unwrap();
@@ -240,14 +273,9 @@ impl ScreenCapturer {
         });
 
         // Create the block for CGDisplayStream callback
-        // CGDisplayStream handler signature:
-        // void (^)(CGDisplayStreamFrameStatus status, uint64_t displayTime,
-        //          IOSurfaceRef frameSurface, CGDisplayStreamUpdateRef updateRef)
-        // The block holds an Arc clone, ensuring the context lives as long as needed
         let block = create_capture_block(Arc::clone(&context));
 
         // Create CGDisplayStream
-        // Using 'BGRA' pixel format (0x42475241)
         let stream = unsafe {
             CGDisplayStreamCreateWithDispatchQueue(
                 display_id,
@@ -264,7 +292,6 @@ impl ScreenCapturer {
             unsafe {
                 dispatch_release(queue);
             }
-            // context Arc will be dropped automatically when function returns
             return Err(BridgeError::Video("Failed to create CGDisplayStream. Check screen recording permission.".into()));
         }
 
@@ -275,13 +302,14 @@ impl ScreenCapturer {
                 dispatch_release(queue);
                 CFRelease(stream as CFTypeRef);
             }
-            // context Arc will be dropped automatically
             return Err(BridgeError::Video(format!("Failed to start CGDisplayStream: {}", result)));
         }
 
-        self.stream = Some(stream);
-        self.queue = Some(queue);
-        self.context = Some(context);
+        self.backend = Some(CaptureBackend::CgDisplayStream {
+            stream,
+            queue,
+            context,
+        });
         self.is_running.store(true, Ordering::SeqCst);
 
         info!("CGDisplayStream started successfully");
@@ -297,26 +325,25 @@ impl ScreenCapturer {
         info!("Stopping screen capture");
         self.is_running.store(false, Ordering::SeqCst);
 
-        // Stop and release the stream
-        // Skip CGDisplayStreamStop if already stopped externally (display disconnect)
-        if let Some(stream) = self.stream.take() {
-            unsafe {
+        match self.backend.take() {
+            Some(CaptureBackend::Sck(sck)) => {
                 if !self.is_stopped.load(Ordering::SeqCst) {
-                    CGDisplayStreamStop(stream);
+                    if let Err(e) = sck.stop() {
+                        warn!("SCK stop error: {}", e);
+                    }
                 }
-                CFRelease(stream as CFTypeRef);
             }
-        }
-
-        // Release the dispatch queue
-        if let Some(queue) = self.queue.take() {
-            unsafe {
-                dispatch_release(queue);
+            Some(CaptureBackend::CgDisplayStream { stream, queue, context: _ }) => {
+                unsafe {
+                    if !self.is_stopped.load(Ordering::SeqCst) {
+                        CGDisplayStreamStop(stream);
+                    }
+                    CFRelease(stream as CFTypeRef);
+                    dispatch_release(queue);
+                }
             }
+            None => {}
         }
-
-        // Context will be dropped when self.context is dropped
-        self.context.take();
 
         Ok(())
     }

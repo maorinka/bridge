@@ -27,6 +27,9 @@ dispatch = { workspace = true }
 metal = { workspace = true }
 core-graphics-types = "0.1.3"
 
+# ScreenCaptureKit (modern macOS screen capture)
+screencapturekit = "1.5"
+
 # For IOSurface and VideoToolbox bindings
 libc = "0.2"
 

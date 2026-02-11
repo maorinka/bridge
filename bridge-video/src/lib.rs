@@ -9,6 +9,7 @@ pub mod capture;
 pub mod codec;
 pub mod display;
 pub mod virtual_display;
+mod sck_capture;
 mod sys;
 
 pub use capture::*;

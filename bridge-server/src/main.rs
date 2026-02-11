@@ -600,13 +600,15 @@ async fn handle_client(
                     }
                 }
 
-                // Process video frames
+                // Process video frames — pipelined: submit ALL captures to encoder first,
+                // then send ALL encoded output. This allows VT to encode frame N+1
+                // while we're sending frame N over the network.
                 let mut frames_this_tick = 0u32;
-                while let Some(mut frame) = capturer.recv_frame() {
-                    frames_this_tick += 1;
 
-                    if is_raw_mode {
-                        // Raw mode: send captured frame data directly (no encoding)
+                if is_raw_mode {
+                    // Raw mode: send captured frame data directly (no encoding)
+                    while let Some(frame) = capturer.recv_frame() {
+                        frames_this_tick += 1;
                         if let Some(video_ch) = conn.video_channel() {
                             let data = frame.read_pixel_data();
                             let fragment_count = data.len().div_ceil(fragment_size);
@@ -618,7 +620,7 @@ async fn handle_client(
                                 let frame_header = VideoFrameHeader {
                                     frame_number: video_frame_number,
                                     pts_us: frame.pts_us,
-                                    is_keyframe: true, // Every raw frame is independently decodable
+                                    is_keyframe: true,
                                     frame_size: data.len() as u32,
                                     fragment_index: i as u16,
                                     fragment_count: fragment_count as u16,
@@ -645,68 +647,67 @@ async fn handle_client(
                                     warn!("Failed to send raw video fragment: {}", e);
                                 }
 
-                                // Yield every 50 fragments so QUIC keepalives can be processed
                                 if i % 50 == 49 {
                                     tokio::task::yield_now().await;
                                 }
                             }
-
                             video_frame_number += 1;
                         }
-                    } else if let Some(ref mut enc) = encoder {
-                        // Encoded mode: encode then send
+                    }
+                } else if let Some(ref mut enc) = encoder {
+                    // Stage 1: Submit ALL captured frames to encoder (fast — just queues to VT)
+                    while let Some(mut frame) = capturer.recv_frame() {
+                        frames_this_tick += 1;
                         debug!("Encoding frame {} ({}x{}, IOSurface={})",
                                frame.frame_number, frame.width, frame.height, frame.io_surface.is_some());
                         if let Err(e) = enc.encode(&mut frame) {
                             warn!("Encode error: {}", e);
                         }
+                    }
 
-                        while let Some(encoded) = enc.recv_frame() {
-                            debug!("Encoded frame: {} bytes, keyframe={}", encoded.data.len(), encoded.is_keyframe);
-                            if let Some(video_ch) = conn.video_channel() {
-                                // Send with proper VideoFrameHeader and fragmentation
-                                let data = &encoded.data;
-                                let fragment_count = data.len().div_ceil(fragment_size);
+                    // Stage 2: Send ALL encoded output (VT may have finished previous frames)
+                    while let Some(encoded) = enc.recv_frame() {
+                        debug!("Encoded frame: {} bytes, keyframe={}", encoded.data.len(), encoded.is_keyframe);
+                        if let Some(video_ch) = conn.video_channel() {
+                            let data = &encoded.data;
+                            let fragment_count = data.len().div_ceil(fragment_size);
 
-                                for (i, chunk) in data.chunks(fragment_size).enumerate() {
-                                    let frame_header = VideoFrameHeader {
-                                        frame_number: video_frame_number,
-                                        pts_us: encoded.pts_us,
-                                        is_keyframe: encoded.is_keyframe && i == 0,
-                                        frame_size: data.len() as u32,
-                                        fragment_index: i as u16,
-                                        fragment_count: fragment_count as u16,
-                                        width: capture_width,
-                                        height: capture_height,
-                                    };
+                            for (i, chunk) in data.chunks(fragment_size).enumerate() {
+                                let frame_header = VideoFrameHeader {
+                                    frame_number: video_frame_number,
+                                    pts_us: encoded.pts_us,
+                                    is_keyframe: encoded.is_keyframe && i == 0,
+                                    frame_size: data.len() as u32,
+                                    fragment_index: i as u16,
+                                    fragment_count: fragment_count as u16,
+                                    width: capture_width,
+                                    height: capture_height,
+                                };
 
-                                    let header_bytes = match bincode::serialize(&frame_header) {
-                                        Ok(b) => b,
-                                        Err(e) => {
-                                            warn!("Failed to serialize frame header: {}", e);
-                                            continue;
-                                        }
-                                    };
-
-                                    let mut packet = Vec::with_capacity(header_bytes.len() + chunk.len());
-                                    packet.extend_from_slice(&header_bytes);
-                                    packet.extend_from_slice(chunk);
-
-                                    if let Err(e) = video_ch.send(
-                                        bridge_common::PacketType::Video,
-                                        &packet,
-                                    ).await {
-                                        warn!("Failed to send video fragment: {}", e);
+                                let header_bytes = match bincode::serialize(&frame_header) {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        warn!("Failed to serialize frame header: {}", e);
+                                        continue;
                                     }
+                                };
 
-                                    // Yield periodically so QUIC keepalives can be processed
-                                    if i % 50 == 49 {
-                                        tokio::task::yield_now().await;
-                                    }
+                                let mut packet = Vec::with_capacity(header_bytes.len() + chunk.len());
+                                packet.extend_from_slice(&header_bytes);
+                                packet.extend_from_slice(chunk);
+
+                                if let Err(e) = video_ch.send(
+                                    bridge_common::PacketType::Video,
+                                    &packet,
+                                ).await {
+                                    warn!("Failed to send video fragment: {}", e);
                                 }
 
-                                video_frame_number += 1;
+                                if i % 50 == 49 {
+                                    tokio::task::yield_now().await;
+                                }
                             }
+                            video_frame_number += 1;
                         }
                     }
                 }

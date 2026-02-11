@@ -256,35 +256,49 @@ impl MetalDisplay {
         width: u32,
         height: u32,
     ) -> BridgeResult<metal::Texture> {
-        // Fall back to copying from IOSurface
+        use metal::foreign_types::ForeignType;
+
+        // Zero-copy: create Metal texture backed directly by the IOSurface.
+        // Metal reads from the IOSurface's GPU memory — no CPU copy needed.
         unsafe {
-            let lock_result = IOSurfaceLock(io_surface, 0, std::ptr::null_mut());
+            let texture_desc = metal::TextureDescriptor::new();
+            texture_desc.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+            texture_desc.set_width(width as u64);
+            texture_desc.set_height(height as u64);
+            texture_desc.set_usage(metal::MTLTextureUsage::ShaderRead);
+
+            let texture_ptr = metal_new_texture_with_iosurface(
+                self.device.as_ptr() as *mut std::ffi::c_void,
+                texture_desc.as_ptr() as *mut std::ffi::c_void,
+                io_surface,
+                0, // plane 0 for single-plane BGRA
+            );
+
+            if texture_ptr.is_null() {
+                // Fall back to CPU copy if IOSurface texture creation fails
+                warn!("Metal IOSurface texture creation failed, falling back to copy");
+                return self.create_texture_from_iosurface_copy(io_surface, width, height);
+            }
+
+            debug!("Created zero-copy Metal texture from IOSurface ({}x{})", width, height);
+            Ok(metal::Texture::from_ptr(texture_ptr as *mut _))
+        }
+    }
+
+    fn create_texture_from_iosurface_copy(
+        &self,
+        io_surface: IOSurfaceRef,
+        width: u32,
+        height: u32,
+    ) -> BridgeResult<metal::Texture> {
+        unsafe {
+            let lock_result = IOSurfaceLock(io_surface, 1, std::ptr::null_mut()); // Read-only
             if lock_result != 0 {
                 return Err(BridgeError::Video("Failed to lock IOSurface".into()));
             }
 
             let base_address = IOSurfaceGetBaseAddress(io_surface);
             let bytes_per_row = IOSurfaceGetBytesPerRow(io_surface);
-            let pixel_format = IOSurfaceGetPixelFormat(io_surface);
-
-            // Expected BGRA = 0x42475241, NV12 (420v) = 0x34323076, NV12 (420f) = 0x34323066
-            // Check first few bytes of data for debugging
-            let first_bytes: [u8; 16] = if !base_address.is_null() {
-                let ptr = base_address as *const [u8; 16];
-                *ptr
-            } else {
-                [0; 16]
-            };
-
-            debug!(
-                "IOSurface: {}x{}, bytes_per_row={}, pixel_format=0x{:08X}, first_bytes={:02X?}, base_addr={:?}",
-                IOSurfaceGetWidth(io_surface),
-                IOSurfaceGetHeight(io_surface),
-                bytes_per_row,
-                pixel_format,
-                first_bytes,
-                base_address
-            );
 
             let texture_desc = metal::TextureDescriptor::new();
             texture_desc.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
@@ -310,8 +324,7 @@ impl MetalDisplay {
                 bytes_per_row as u64,
             );
 
-            IOSurfaceUnlock(io_surface, 0, std::ptr::null_mut());
-
+            IOSurfaceUnlock(io_surface, 1, std::ptr::null_mut());
             Ok(texture)
         }
     }

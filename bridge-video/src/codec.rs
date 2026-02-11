@@ -33,7 +33,7 @@ pub struct EncodedFrame {
 /// Decoded video frame
 #[derive(Debug)]
 pub struct DecodedFrame {
-    /// Pixel data (BGRA)
+    /// Pixel data (BGRA) — empty in zero-copy path
     pub data: Vec<u8>,
     /// Frame width
     pub width: u32,
@@ -45,9 +45,21 @@ pub struct DecodedFrame {
     pub pts_us: u64,
     /// IOSurface for zero-copy Metal rendering
     pub io_surface: Option<IOSurfaceRef>,
+    /// Retained CVPixelBuffer that owns the IOSurface — released on drop
+    pub cv_pixel_buffer: Option<CVPixelBufferRef>,
 }
 
 unsafe impl Send for DecodedFrame {}
+
+impl Drop for DecodedFrame {
+    fn drop(&mut self) {
+        if let Some(pb) = self.cv_pixel_buffer.take() {
+            unsafe {
+                CVPixelBufferRelease(pb);
+            }
+        }
+    }
+}
 
 /// Video encoder configuration
 #[derive(Debug, Clone)]
@@ -1456,48 +1468,48 @@ extern "C" fn decoder_output_callback(
         let width = CVPixelBufferGetWidth(image_buffer) as u32;
         let height = CVPixelBufferGetHeight(image_buffer) as u32;
         let bytes_per_row = CVPixelBufferGetBytesPerRow(image_buffer) as u32;
-
-        // Lock pixel buffer for CPU access
-        let lock_result = CVPixelBufferLockBaseAddress(image_buffer, 1); // Read-only
-        if lock_result != NO_ERR {
-            warn!("Failed to lock pixel buffer: {}", lock_result);
-            return;
-        }
-
-        let base_address = CVPixelBufferGetBaseAddress(image_buffer);
-        let data_len = (bytes_per_row * height) as usize;
-
-        let data = if !base_address.is_null() && data_len > 0 {
-            std::slice::from_raw_parts(base_address as *const u8, data_len).to_vec()
-        } else {
-            vec![]
-        };
-
-        CVPixelBufferUnlockBaseAddress(image_buffer, 1);
-
-        // Get IOSurface for zero-copy Metal rendering
+        let pixel_format = CVPixelBufferGetPixelFormatType(image_buffer);
         let io_surface = CVPixelBufferGetIOSurface(image_buffer);
+
+        // BGRA format with IOSurface available → zero-copy path
+        let use_zero_copy = !io_surface.is_null() && pixel_format == 0x42475241;
+
+        let (data, cv_pixel_buffer, io_surface_opt) = if use_zero_copy {
+            // Zero-copy: retain the CVPixelBuffer to keep the IOSurface alive.
+            // Metal will create a texture directly from the IOSurface — no CPU copy.
+            CVPixelBufferRetain(image_buffer);
+            (Vec::new(), Some(image_buffer), Some(io_surface))
+        } else {
+            // Fallback: copy pixel data (for NV12 or when no IOSurface)
+            let lock_result = CVPixelBufferLockBaseAddress(image_buffer, 1);
+            if lock_result != NO_ERR {
+                warn!("Failed to lock pixel buffer: {}", lock_result);
+                return;
+            }
+            let base_address = CVPixelBufferGetBaseAddress(image_buffer);
+            let data_len = (bytes_per_row * height) as usize;
+            let data = if !base_address.is_null() && data_len > 0 {
+                std::slice::from_raw_parts(base_address as *const u8, data_len).to_vec()
+            } else {
+                vec![]
+            };
+            CVPixelBufferUnlockBaseAddress(image_buffer, 1);
+            (data, None, None)
+        };
 
         let frame_num = ctx.frame_count.fetch_add(1, Ordering::SeqCst);
 
-        // Check pixel format
-        let pixel_format = CVPixelBufferGetPixelFormatType(image_buffer);
-        let format_str = match pixel_format {
-            0x42475241 => "BGRA",
-            0x34323076 => "420v (NV12)",
-            0x34323066 => "420f (NV12)",
-            _ => "unknown",
-        };
-
-        // Log every 60 frames (once per second at 60fps)
+        // Log every 60 frames
         if frame_num % 60 == 0 {
-            info!("Decoded frame {} ({}x{}, format={} 0x{:08X}, {} bytes)",
-                  frame_num, width, height, format_str, pixel_format, data.len());
+            let format_str = match pixel_format {
+                0x42475241 => "BGRA",
+                0x34323076 => "420v",
+                0x34323066 => "420f",
+                _ => "unknown",
+            };
+            info!("Decoded frame {} ({}x{}, format={}, zero_copy={})",
+                  frame_num, width, height, format_str, use_zero_copy);
         }
-
-        // For NV12 format, the data copy won't work correctly
-        // Force disable IOSurface path for now and only use if format is BGRA
-        let use_io_surface = !io_surface.is_null() && pixel_format == 0x42475241;
 
         let frame = DecodedFrame {
             data,
@@ -1505,11 +1517,8 @@ extern "C" fn decoder_output_callback(
             height,
             bytes_per_row,
             pts_us: presentation_time_stamp.microseconds(),
-            io_surface: if use_io_surface {
-                Some(io_surface)
-            } else {
-                None
-            },
+            io_surface: io_surface_opt,
+            cv_pixel_buffer,
         };
 
         if let Err(e) = ctx.frame_tx.try_send(frame) {

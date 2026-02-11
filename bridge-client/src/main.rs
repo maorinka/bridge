@@ -630,6 +630,7 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
                         bytes_per_row: complete_header.width * 4,
                         pts_us: complete_header.pts_us,
                         io_surface: None,
+                        cv_pixel_buffer: None,
                     })
                 } else {
                     None

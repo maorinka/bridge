@@ -576,3 +576,35 @@ extern "C" {
     pub fn dispatch_queue_create(label: *const i8, attr: *const c_void) -> DispatchQueueRef;
     pub fn dispatch_release(object: *mut c_void);
 }
+
+// Objective-C runtime for Metal IOSurface texture creation
+#[link(name = "objc", kind = "dylib")]
+extern "C" {
+    fn sel_registerName(name: *const i8) -> *const c_void;
+    fn objc_msgSend();
+}
+
+/// Create a Metal texture backed by an IOSurface (zero-copy).
+/// Calls [MTLDevice newTextureWithDescriptor:iosurface:plane:]
+///
+/// # Safety
+/// - `device` must be a valid MTLDevice pointer
+/// - `descriptor` must be a valid MTLTextureDescriptor pointer
+/// - `iosurface` must be a valid IOSurfaceRef
+pub unsafe fn metal_new_texture_with_iosurface(
+    device: *mut c_void,
+    descriptor: *mut c_void,
+    iosurface: IOSurfaceRef,
+    plane: usize,
+) -> *mut c_void {
+    type MsgSendFn = unsafe extern "C" fn(
+        *mut c_void, *const c_void, *mut c_void, IOSurfaceRef, usize,
+    ) -> *mut c_void;
+
+    let sel = sel_registerName(
+        b"newTextureWithDescriptor:iosurface:plane:\0".as_ptr() as *const i8,
+    );
+
+    let f: MsgSendFn = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    f(device, sel, descriptor, iosurface, plane)
+}
