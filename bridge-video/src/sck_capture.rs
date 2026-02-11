@@ -37,9 +37,11 @@ impl SCStreamOutputTrait for SckHandler {
             return;
         }
 
-        // Check frame status — only process complete frames
+        // Check frame status — only process complete frames.
+        // Note: frame_status() returns None when the crate's Swift bridge can't parse
+        // the attachment. Treat None as Complete since the frame data is valid.
         match sample.frame_status() {
-            Some(SCFrameStatus::Complete) => {}
+            Some(SCFrameStatus::Complete) | None => {}
             Some(SCFrameStatus::Stopped) => {
                 warn!("ScreenCaptureKit stream stopped (display disconnected?)");
                 self.is_stopped.store(true, Ordering::SeqCst);
@@ -47,7 +49,7 @@ impl SCStreamOutputTrait for SckHandler {
             }
             Some(SCFrameStatus::Idle) => return,   // No new content
             Some(SCFrameStatus::Blank) => return,   // Display blanked
-            _ => return,
+            Some(_) => return,
         }
 
         let pixel_buffer = match sample.image_buffer() {

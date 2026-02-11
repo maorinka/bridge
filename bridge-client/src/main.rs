@@ -14,6 +14,8 @@ use bridge_transport::{
     is_thunderbolt_connection,
 };
 use bridge_video::{MetalDisplay, VideoDecoder, DecodedFrame};
+// TODO: Input disabled - focus on video first
+#[allow(unused_imports)]
 use bridge_input::{CaptureConfig, InputCapturer};
 use bridge_audio::{PlaybackConfig, AudioPlayer, AudioPacket};
 use clap::Parser;
@@ -401,11 +403,12 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
                 error!("Failed to send audio ping: {}", e);
             }
         }
-        if let Some(input_ch) = conn.input_channel() {
-            if let Err(e) = input_ch.send(bridge_common::PacketType::Input, b"ping").await {
-                error!("Failed to send input ping: {}", e);
-            }
-        }
+        // TODO: Input disabled - focus on video first
+        // if let Some(input_ch) = conn.input_channel() {
+        //     if let Err(e) = input_ch.send(bridge_common::PacketType::Input, b"ping").await {
+        //         error!("Failed to send input ping: {}", e);
+        //     }
+        // }
     }
     debug!("UDP pings sent (10 attempts over 900ms)");
 
@@ -443,17 +446,19 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
         }
     };
 
-    let mut input_capturer = if !args.view_only {
-        let capture_config = CaptureConfig {
-            listen_only: false,
-            ..Default::default()
-        };
-        let mut capturer = InputCapturer::new(capture_config)?;
-        capturer.start()?;
-        Some(capturer)
-    } else {
-        None
-    };
+    // TODO: Input capture disabled - focus on video first
+    let input_capturer: Option<InputCapturer> = None;
+    // let mut input_capturer = if !args.view_only {
+    //     let capture_config = CaptureConfig {
+    //         listen_only: false,
+    //         ..Default::default()
+    //     };
+    //     let mut capturer = InputCapturer::new(capture_config)?;
+    //     capturer.start()?;
+    //     Some(capturer)
+    // } else {
+    //     None
+    // };
 
     info!("Client components initialized");
 
@@ -681,15 +686,15 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
             }
         }
 
-        // Capture and send input events
-        if let Some(ref capturer) = input_capturer {
-            while let Some(event) = capturer.recv_event() {
-                if let Some(input_ch) = conn.input_channel() {
-                    let data = event.to_bytes()?;
-                    let _ = input_ch.send(bridge_common::PacketType::Input, &data).await;
-                }
-            }
-        }
+        // TODO: Input disabled - focus on video first
+        // if let Some(ref capturer) = input_capturer {
+        //     while let Some(event) = capturer.recv_event() {
+        //         if let Some(input_ch) = conn.input_channel() {
+        //             let data = event.to_bytes()?;
+        //             let _ = input_ch.send(bridge_common::PacketType::Input, &data).await;
+        //         }
+        //     }
+        // }
 
         // Send periodic latency reports
         // Note: We can't measure true network latency without clock sync (NTP/PTP)
@@ -754,9 +759,10 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
     }
 
     // Clean up
-    if let Some(ref mut capturer) = input_capturer {
-        capturer.stop()?;
-    }
+    // TODO: Input disabled - focus on video first
+    // if let Some(ref mut capturer) = input_capturer {
+    //     capturer.stop()?;
+    // }
     if let Some(ref mut p) = player {
         let _ = p.stop();
     }
