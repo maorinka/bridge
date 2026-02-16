@@ -147,6 +147,8 @@ impl VirtualDisplay {
             extern "C" {
                 fn CGDisplayPixelsWide(display: u32) -> usize;
                 fn CGDisplayPixelsHigh(display: u32) -> usize;
+                fn CGDisplayShowCursor(display: u32) -> i32;
+                fn CGWarpMouseCursorPosition(point: NSPoint) -> i32;
             }
             let mut ready = false;
             for attempt in 0..20 {
@@ -163,6 +165,15 @@ impl VirtualDisplay {
             if !ready {
                 warn!("Virtual display {} not yet visible in display list after 2s", display_id);
             }
+
+            // Ensure cursor is visible on the virtual display.
+            // On headless setups the cursor is often hidden by default.
+            CGDisplayShowCursor(display_id);
+            CGWarpMouseCursorPosition(NSPoint {
+                x: width as f64 / 2.0,
+                y: height as f64 / 2.0,
+            });
+            info!("Cursor shown and warped to center of virtual display");
 
             Ok(Self {
                 _display: display,
