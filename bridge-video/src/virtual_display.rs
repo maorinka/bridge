@@ -9,7 +9,7 @@ use bridge_common::{BridgeResult, BridgeError};
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{class, msg_send, msg_send_id};
+use objc2::{class, msg_send};
 use objc2_foundation::{NSPoint, NSSize, NSString, NSArray};
 
 // Chromium uses vendorID=505 — macOS 14+ rejects vendorID=0
@@ -40,7 +40,7 @@ impl VirtualDisplay {
 
         unsafe {
             let descriptor_class = class!(CGVirtualDisplayDescriptor);
-            let descriptor: Retained<AnyObject> = msg_send_id![descriptor_class, new];
+            let descriptor: Retained<AnyObject> = msg_send![descriptor_class, new];
 
             // Display name
             let name = NSString::from_str("Bridge Virtual Display");
@@ -91,8 +91,8 @@ impl VirtualDisplay {
 
             // Create the virtual display from descriptor
             let display_class = class!(CGVirtualDisplay);
-            let display: Option<Retained<AnyObject>> = msg_send_id![
-                msg_send_id![display_class, alloc],
+            let display: Option<Retained<AnyObject>> = msg_send![
+                msg_send![display_class, alloc],
                 initWithDescriptor: &*descriptor
             ];
 
@@ -117,25 +117,21 @@ impl VirtualDisplay {
 
             // Apply settings with display mode
             let settings_class = class!(CGVirtualDisplaySettings);
-            let settings: Retained<AnyObject> = msg_send_id![settings_class, new];
+            let settings: Retained<AnyObject> = msg_send![settings_class, new];
 
-            // HiDPI (Retina) mode: macOS renders at half logical resolution
-            // with 2x backing pixels, producing crisp text and UI.
-            // e.g. 3840x2160 backing with 1920x1080 logical.
-            let _: () = msg_send![&settings, setHiDPI: true];
+            // Use native (non-HiDPI) mode at full pixel resolution.
+            // HiDPI=true on CGVirtualDisplay doesn't reliably produce 2x backing
+            // pixels — macOS renders at the logical resolution (e.g. 1920x1080)
+            // and SCK upscales, causing blurry output.
+            // Native 3840x2160 gives pixel-sharp capture at the cost of smaller
+            // UI elements (same as a non-Retina 4K monitor).
+            let _: () = msg_send![&settings, setHiDPI: false];
 
-            if width % 2 != 0 || height % 2 != 0 {
-                return Err(BridgeError::Video(format!(
-                    "HiDPI requires even dimensions, got {}x{}", width, height
-                )));
-            }
-            let logical_width = width / 2;
-            let logical_height = height / 2;
             let mode_class = class!(CGVirtualDisplayMode);
-            let mode: Retained<AnyObject> = msg_send_id![
-                msg_send_id![mode_class, alloc],
-                initWithWidth: logical_width as usize,
-                height: logical_height as usize,
+            let mode: Retained<AnyObject> = msg_send![
+                msg_send![mode_class, alloc],
+                initWithWidth: width as usize,
+                height: height as usize,
                 refreshRate: refresh_rate as f64
             ];
 
@@ -183,8 +179,8 @@ impl VirtualDisplay {
             // may not be at the global origin.
             CGDisplayShowCursor(display_id);
             CGDisplayMoveCursorToPoint(display_id, NSPoint {
-                x: logical_width as f64 / 2.0,
-                y: logical_height as f64 / 2.0,
+                x: width as f64 / 2.0,
+                y: height as f64 / 2.0,
             });
             info!("Cursor shown and moved to center of virtual display (local coords)");
 

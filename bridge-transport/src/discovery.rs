@@ -87,6 +87,7 @@ extern "C" {
         context: *mut c_void,
     ) -> DNSServiceErrorType;
 
+    #[allow(dead_code)]
     fn DNSServiceGetAddrInfo(
         sd_ref: *mut DNSServiceRef,
         flags: DNSServiceFlags,
@@ -107,6 +108,7 @@ extern "C" {
     ) -> DNSServiceErrorType;
 
     fn DNSServiceRefDeallocate(sd_ref: DNSServiceRef);
+    #[allow(dead_code)]
     fn DNSServiceRefSockFD(sd_ref: DNSServiceRef) -> i32;
     fn DNSServiceProcessResult(sd_ref: DNSServiceRef) -> DNSServiceErrorType;
 }
@@ -122,6 +124,7 @@ pub enum DiscoveryEvent {
 
 /// Context for DNS-SD registration callback
 struct AdvertiserContext {
+    #[allow(dead_code)]
     name: String,
     registered: bool,
 }
@@ -129,6 +132,7 @@ struct AdvertiserContext {
 /// Service advertiser for servers
 pub struct ServiceAdvertiser {
     name: String,
+    #[allow(dead_code)]
     port: u16,
     service_ref: Option<DNSServiceRef>,
     _context: Option<Box<AdvertiserContext>>,

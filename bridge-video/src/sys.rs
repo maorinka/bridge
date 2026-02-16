@@ -6,6 +6,8 @@
 //! - IOSurface (for zero-copy frame access)
 //! - CoreMedia (CMSampleBuffer, CMTime, etc.)
 
+#![allow(dead_code)]
+
 use std::ffi::c_void;
 use std::ptr;
 
@@ -410,6 +412,7 @@ extern "C" {
 }
 
 #[repr(C)]
+#[allow(non_snake_case)]
 pub struct VTDecompressionOutputCallbackRecord {
     pub decompressionOutputCallback: *const c_void,
     pub decompressionOutputRefCon: *mut c_void,

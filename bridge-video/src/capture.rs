@@ -125,6 +125,7 @@ impl From<&VideoConfig> for CaptureConfig {
 }
 
 /// Context passed to CGDisplayStream callback
+#[allow(dead_code)]
 struct CaptureContext {
     frame_tx: Sender<CapturedFrame>,
     frame_count: Arc<AtomicU64>,
@@ -141,6 +142,7 @@ enum CaptureBackend {
     CgDisplayStream {
         stream: CGDisplayStreamRef,
         queue: DispatchQueueRef,
+        #[allow(dead_code)]
         context: Arc<CaptureContext>,
     },
 }

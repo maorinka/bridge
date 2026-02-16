@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use parking_lot::RwLock;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
 use tracing::{debug, error, info, warn};
 
 /// QUIC connection for the control channel

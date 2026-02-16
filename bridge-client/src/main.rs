@@ -22,18 +22,16 @@ use clap::Parser;
 use anyhow::anyhow;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use parking_lot::Mutex;
 use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 // macOS imports for window creation
 use objc2::rc::Retained;
-use objc2::{ClassType, MainThreadOnly};
-use objc2_foundation::{MainThreadMarker, NSString, NSPoint, NSSize, NSRect, NSDefaultRunLoopMode};
+use objc2::MainThreadOnly;
+use objc2_foundation::{MainThreadMarker, NSString, NSPoint, NSSize, NSRect};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSWindow, NSWindowStyleMask,
-    NSBackingStoreType, NSView, NSEvent, NSEventMask,
+    NSBackingStoreType, NSView, NSEventMask,
 };
 use objc2_quartz_core::CAMetalLayer;
 use metal::foreign_types::ForeignType;
@@ -183,12 +181,10 @@ struct Args {
 fn create_window(mtm: MainThreadMarker, width: u32, height: u32, fullscreen: bool) -> (Retained<NSWindow>, MetalLayer) {
     // Get screen frame for fullscreen
     let screen_frame = if fullscreen {
-        unsafe {
-            if let Some(screen) = NSScreen::mainScreen(mtm) {
-                screen.frame()
-            } else {
-                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width as f64, height as f64))
-            }
+        if let Some(screen) = NSScreen::mainScreen(mtm) {
+            screen.frame()
+        } else {
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width as f64, height as f64))
         }
     } else {
         NSRect::new(NSPoint::new(100.0, 100.0), NSSize::new(width as f64, height as f64))
@@ -215,27 +211,25 @@ fn create_window(mtm: MainThreadMarker, width: u32, height: u32, fullscreen: boo
     };
 
     // Set window properties
-    unsafe {
-        let title = NSString::from_str("Bridge");
-        window.setTitle(&title);
-        window.setAcceptsMouseMovedEvents(true);
+    let title = NSString::from_str("Bridge");
+    window.setTitle(&title);
+    window.setAcceptsMouseMovedEvents(true);
 
-        if fullscreen {
-            window.setCollectionBehavior(
-                objc2_app_kit::NSWindowCollectionBehavior::FullScreenPrimary
-            );
-        }
+    if fullscreen {
+        window.setCollectionBehavior(
+            objc2_app_kit::NSWindowCollectionBehavior::FullScreenPrimary
+        );
     }
 
     // Create a content view with layer backing
-    let content_view = unsafe {
+    let content_view = {
         let view = NSView::initWithFrame(NSView::alloc(mtm), screen_frame);
         view.setWantsLayer(true);
         view
     };
 
     // Create CAMetalLayer
-    let ca_layer = unsafe { CAMetalLayer::new() };
+    let ca_layer = CAMetalLayer::new();
 
     // Wrap in metal-rs MetalLayer
     let metal_layer = unsafe {
@@ -248,15 +242,13 @@ fn create_window(mtm: MainThreadMarker, width: u32, height: u32, fullscreen: boo
         let layer_ptr = metal_layer.as_ptr();
         let layer: &CAMetalLayer = &*(layer_ptr as *const CAMetalLayer);
         content_view.setLayer(Some(layer));
-
-        window.setContentView(Some(&content_view));
     }
+
+    window.setContentView(Some(&content_view));
 
     // Show window
-    unsafe {
-        window.makeKeyAndOrderFront(None);
-        window.center();
-    }
+    window.makeKeyAndOrderFront(None);
+    window.center();
 
     (window, metal_layer)
 }
@@ -294,10 +286,9 @@ fn main() -> Result<()> {
 
     // Initialize NSApplication
     let app = NSApplication::sharedApplication(mtm);
-    unsafe {
-        app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
-        app.activateIgnoringOtherApps(true);
-    }
+    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+    #[allow(deprecated)]
+    app.activateIgnoringOtherApps(true);
 
     // Build and run the tokio runtime for async operations
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -417,7 +408,7 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
     // Create window with Metal layer - use native resolution for now
     // The actual frame size may differ from requested
     let fullscreen = !args.windowed;
-    let (window, metal_layer) = create_window(mtm, display_width, display_height, fullscreen);
+    let (_window, metal_layer) = create_window(mtm, display_width, display_height, fullscreen);
     info!("Window created: {}x{}, fullscreen={}", display_width, display_height, fullscreen);
 
     // Initialize display with local screen size - will render frames scaled
@@ -428,8 +419,8 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
     // Decoder will be created lazily when we receive first frame with actual dimensions
     let mut decoder: Option<VideoDecoder> = None;
     let video_codec = video_config.codec;
-    let mut actual_frame_width: Option<u32> = None;
-    let mut actual_frame_height: Option<u32> = None;
+    let mut _actual_frame_width: Option<u32> = None;
+    let mut _actual_frame_height: Option<u32> = None;
 
     let playback_config = PlaybackConfig::from(&audio_config);
     let mut player: Option<AudioPlayer> = match AudioPlayer::new(playback_config) {
@@ -449,7 +440,7 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
     };
 
     // TODO: Input capture disabled - focus on video first
-    let input_capturer: Option<InputCapturer> = None;
+    let _input_capturer: Option<InputCapturer> = None;
     // let mut input_capturer = if !args.view_only {
     //     let capture_config = CaptureConfig {
     //         listen_only: false,
@@ -607,8 +598,8 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
                 if decoder.is_none() && video_codec != bridge_common::VideoCodec::Raw {
                     info!("Creating decoder for {}x{} frames",
                           complete_header.width, complete_header.height);
-                    actual_frame_width = Some(complete_header.width);
-                    actual_frame_height = Some(complete_header.height);
+                    _actual_frame_width = Some(complete_header.width);
+                    _actual_frame_height = Some(complete_header.height);
                     decoder = Some(VideoDecoder::new(
                         complete_header.width,
                         complete_header.height,

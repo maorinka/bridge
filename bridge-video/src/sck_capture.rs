@@ -18,7 +18,7 @@ use tracing::{debug, info, warn};
 use crate::capture::CapturedFrame;
 // Use specific imports from sys to avoid name conflicts with screencapturekit's CMTime
 use crate::sys::{
-    CFTypeRef, CFRetain, IOSurfaceRef, IOSurfaceIncrementUseCount,
+    CFTypeRef, CFRetain, IOSurfaceIncrementUseCount,
     CVPixelBufferGetIOSurface,
 };
 

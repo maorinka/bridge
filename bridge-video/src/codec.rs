@@ -775,7 +775,9 @@ struct DecoderCallbackContext {
 
 /// Hardware video decoder using VideoToolbox
 pub struct VideoDecoder {
+    #[allow(dead_code)]
     width: u32,
+    #[allow(dead_code)]
     height: u32,
     codec: VideoCodec,
     session: VTDecompressionSessionRef,

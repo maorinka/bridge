@@ -4,6 +4,10 @@
 //! - CGEventTap (for event capture at the Quartz level)
 //! - IOHIDManager (for raw HID device access)
 //! - CGEvent (for event creation and posting)
+//!
+//! Many of these bindings are not yet used because input capture/injection
+//! is currently disabled. They will be needed when input is re-enabled.
+#![allow(dead_code)]
 
 use std::ffi::c_void;
 
