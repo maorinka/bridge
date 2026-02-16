@@ -32,8 +32,10 @@ impl QuicConnection {
 
         info!("Connecting to QUIC server at {}", addr);
 
+        // Use the remote IP as SNI identifier so TOFU trust is scoped per endpoint.
+        let server_name = addr.ip().to_string();
         let connection = endpoint
-            .connect(addr, "bridge")
+            .connect(addr, &server_name)
             .map_err(|e| BridgeError::Transport(format!("Connection failed: {}", e)))?
             .await
             .map_err(|e| BridgeError::Transport(format!("Connection failed: {}", e)))?;

@@ -2,10 +2,10 @@
 
 use bridge_common::{BridgeError, BridgeResult, PacketHeader, PacketType};
 use bytes::{Bytes, BytesMut};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 
 /// UDP channel for low-latency data transfer
 pub struct UdpChannel {
@@ -16,6 +16,8 @@ pub struct UdpChannel {
     recv_buffer: BytesMut,
     /// True if socket.connect() was called (client mode)
     is_connected: bool,
+    /// Optional IP allowlist for unconnected server-mode sockets
+    allowed_remote_ip: Option<IpAddr>,
 }
 
 impl UdpChannel {
@@ -43,6 +45,7 @@ impl UdpChannel {
             send_sequence: 0,
             recv_buffer: BytesMut::with_capacity(max_packet_size),
             is_connected: false,
+            allowed_remote_ip: None,
         })
     }
 
@@ -73,6 +76,7 @@ impl UdpChannel {
             send_sequence: 0,
             recv_buffer: BytesMut::with_capacity(max_packet_size),
             is_connected: true,
+            allowed_remote_ip: Some(remote_addr.ip()),
         })
     }
 
@@ -121,6 +125,11 @@ impl UdpChannel {
     /// Set the remote address (for server mode after receiving first packet)
     pub fn set_remote_addr(&mut self, addr: SocketAddr) {
         self.remote_addr = Some(addr);
+    }
+
+    /// Restrict accepted source IP for server-mode sockets.
+    pub fn set_allowed_remote_ip(&mut self, ip: IpAddr) {
+        self.allowed_remote_ip = Some(ip);
     }
 
     /// Send raw data with a packet header
@@ -180,17 +189,53 @@ impl UdpChannel {
                 BridgeError::Transport(format!("Receive failed: {}", e))
             })?
         } else {
-            debug!("Waiting to receive on {:?}", self.socket.local_addr());
-            let (len, from) = self.socket.recv_from(buf).await.map_err(|e| {
-                BridgeError::Transport(format!("Receive failed: {}", e))
-            })?;
-            debug!("Received {} bytes from {} on {:?}", len, from, self.socket.local_addr());
+            loop {
+                debug!("Waiting to receive on {:?}", self.socket.local_addr());
+                let (len, from) = self.socket.recv_from(buf).await.map_err(|e| {
+                    BridgeError::Transport(format!("Receive failed: {}", e))
+                })?;
+                debug!("Received {} bytes from {} on {:?}", len, from, self.socket.local_addr());
 
-            // Update remote address if not set
-            if self.remote_addr.is_none() {
-                self.remote_addr = Some(from);
+                if let Some(allowed_ip) = self.allowed_remote_ip {
+                    if from.ip() != allowed_ip {
+                        warn!("Dropping UDP packet from unexpected IP {} (expected {})", from.ip(), allowed_ip);
+                        continue;
+                    }
+                }
+
+                if let Some(bound_addr) = self.remote_addr {
+                    if from != bound_addr {
+                        warn!("Dropping UDP packet from unexpected peer {} (expected {})", from, bound_addr);
+                        continue;
+                    }
+                }
+
+                if len < PacketHeader::SIZE {
+                    warn!("Dropping undersized UDP packet ({} bytes)", len);
+                    continue;
+                }
+
+                let header = match PacketHeader::from_bytes(&buf[..PacketHeader::SIZE]) {
+                    Ok(header) => header,
+                    Err(e) => {
+                        warn!("Dropping UDP packet with invalid header serialization: {}", e);
+                        continue;
+                    }
+                };
+
+                if !header.is_valid() {
+                    warn!("Dropping UDP packet with invalid header");
+                    continue;
+                }
+
+                if self.remote_addr.is_none() {
+                    self.remote_addr = Some(from);
+                }
+
+                let data = Bytes::copy_from_slice(&buf[PacketHeader::SIZE..len]);
+                trace!("Received {} bytes (seq: {}, type: {:?})", len, header.sequence, header.packet_type);
+                return Ok((header, data));
             }
-            len
         };
 
         if len < PacketHeader::SIZE {
@@ -214,11 +259,31 @@ impl UdpChannel {
     pub async fn recv_raw(&mut self) -> BridgeResult<(Bytes, SocketAddr)> {
         let mut buf = vec![0u8; self.max_packet_size];
 
-        let (len, from) = self.socket.recv_from(&mut buf).await.map_err(|e| {
-            BridgeError::Transport(format!("Receive failed: {}", e))
-        })?;
+        loop {
+            let (len, from) = self.socket.recv_from(&mut buf).await.map_err(|e| {
+                BridgeError::Transport(format!("Receive failed: {}", e))
+            })?;
 
-        Ok((Bytes::copy_from_slice(&buf[..len]), from))
+            if let Some(allowed_ip) = self.allowed_remote_ip {
+                if from.ip() != allowed_ip {
+                    warn!("Dropping raw UDP packet from unexpected IP {} (expected {})", from.ip(), allowed_ip);
+                    continue;
+                }
+            }
+
+            if let Some(bound_addr) = self.remote_addr {
+                if from != bound_addr {
+                    warn!("Dropping raw UDP packet from unexpected peer {} (expected {})", from, bound_addr);
+                    continue;
+                }
+            }
+
+            if self.remote_addr.is_none() {
+                self.remote_addr = Some(from);
+            }
+
+            return Ok((Bytes::copy_from_slice(&buf[..len]), from));
+        }
     }
 
     /// Try to receive without blocking (returns None if no data available)

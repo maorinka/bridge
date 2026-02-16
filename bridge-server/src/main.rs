@@ -61,6 +61,10 @@ struct Args {
     /// Verbose logging
     #[arg(short, long)]
     verbose: bool,
+
+    /// Require exact negotiated resolution (fail instead of falling back)
+    #[arg(long)]
+    strict_resolution: bool,
 }
 
 #[tokio::main]
@@ -152,6 +156,7 @@ async fn main() -> Result<()> {
                                 video_config,
                                 audio_config,
                                 no_audio,
+                                args.strict_resolution,
                             ).await {
                                 error!("Client session error: {}", e);
                             }
@@ -184,6 +189,7 @@ async fn handle_client(
     _video_config: VideoConfig,
     audio_config: AudioConfig,
     no_audio: bool,
+    strict_resolution: bool,
 ) -> Result<()> {
     let remote_addr = control_conn.remote_addr();
     info!("Client connected from {}", remote_addr);
@@ -213,10 +219,9 @@ async fn handle_client(
     // For Thunderbolt: use larger packets and socket buffers
     let mut config = config;
     if is_thunderbolt {
-        config.max_packet_size = bridge_common::MAX_UDP_PACKET_SIZE_THUNDERBOLT;
         config.send_buffer_size = 64 * 1024 * 1024; // 64MB
         config.recv_buffer_size = 64 * 1024 * 1024;
-        info!("Thunderbolt: packet_size=65507, socket_buffers=64MB");
+        info!("Thunderbolt: using MTU-safe packet size with 64MB socket buffers");
     }
     let max_packet_size = config.max_packet_size;
 
@@ -232,8 +237,29 @@ async fn handle_client(
             // H.265 at 200 Mbps looks near-perfect and fits easily
             if is_thunderbolt {
                 cfg.codec = bridge_common::VideoCodec::H265;
-                cfg.bitrate = 500_000_000; // 500 Mbps - near-lossless for Thunderbolt
-                info!("Thunderbolt: using H.265 at 500 Mbps (max quality)");
+                cfg.bitrate = 200_000_000; // 200 Mbps - high quality with better packet stability
+                info!("Thunderbolt: using H.265 at 200 Mbps");
+            }
+
+            // If virtual displays are unavailable and requested resolution differs from native,
+            // optionally negotiate to native resolution to avoid blurry upscaling capture.
+            if has_physical_display
+                && !is_virtual_display_supported()
+                && (cfg.width != native_width || cfg.height != native_height)
+            {
+                if strict_resolution {
+                    warn!(
+                        "Strict resolution mode: requested {}x{} cannot be guaranteed without virtual display support",
+                        cfg.width, cfg.height
+                    );
+                } else {
+                    warn!(
+                        "Virtual display not supported; falling back to native capture resolution {}x{}",
+                        native_width, native_height
+                    );
+                    cfg.width = native_width;
+                    cfg.height = native_height;
+                }
             }
             cfg
         }
@@ -254,6 +280,7 @@ async fn handle_client(
         || video_config.height != native_height;
 
     // Try to create virtual display; capture_display_id is used by CGDisplayStream
+    let mut use_native_resolution_fallback = false;
     let capture_display_id = if need_virtual_display {
         let vd_width = if video_config.width > 0 { video_config.width } else { 3840 };
         let vd_height = if video_config.height > 0 { video_config.height } else { 2160 };
@@ -268,8 +295,19 @@ async fn handle_client(
                 }
                 Err(e) => {
                     if has_physical_display {
-                        warn!("Virtual display failed ({}), using native display (CGDisplayStream will scale to {}x{})",
-                              e, video_config.width, video_config.height);
+                        if strict_resolution {
+                            return Err(anyhow::anyhow!(
+                                "Strict resolution enabled: failed to create virtual display for {}x{}: {}",
+                                video_config.width,
+                                video_config.height,
+                                e
+                            ));
+                        }
+                        warn!(
+                            "Virtual display failed ({}), falling back to native display resolution {}x{}",
+                            e, native_width, native_height
+                        );
+                        use_native_resolution_fallback = true;
                         None
                     } else {
                         error!("Failed to create virtual display: {}. No display available!", e);
@@ -278,8 +316,18 @@ async fn handle_client(
                 }
             }
         } else if has_physical_display {
-            info!("Virtual display not supported, using native display");
-            None
+            if strict_resolution {
+                return Err(anyhow::anyhow!(
+                    "Strict resolution enabled: virtual display not supported and requested {}x{} differs from native {}x{}",
+                    video_config.width,
+                    video_config.height,
+                    native_width,
+                    native_height
+                ));
+            } else {
+                info!("Virtual display not supported, using native display");
+                None
+            }
         } else {
             error!("Headless mode requires macOS 14+ for virtual display support");
             return Err(anyhow::anyhow!("No display available: virtual display not supported"));
@@ -289,8 +337,21 @@ async fn handle_client(
     };
 
     // Always capture at the negotiated resolution — CGDisplayStream handles scaling
-    let capture_width = video_config.width;
-    let capture_height = video_config.height;
+    let (capture_width, capture_height) = if use_native_resolution_fallback && has_physical_display {
+        (native_width, native_height)
+    } else {
+        (video_config.width, video_config.height)
+    };
+
+    if strict_resolution && (capture_width != video_config.width || capture_height != video_config.height) {
+        return Err(anyhow::anyhow!(
+            "Strict resolution enabled: capture would use {}x{} instead of requested {}x{}",
+            capture_width,
+            capture_height,
+            video_config.width,
+            video_config.height
+        ));
+    }
 
     info!("Capture resolution: {}x{} @ {}fps, codec: {:?}", capture_width, capture_height, video_config.fps, video_config.codec);
 
@@ -354,19 +415,27 @@ async fn handle_client(
     // Adaptive bitrate control state (based on packet loss only)
     // Only relevant for encoded (non-raw) modes
     let initial_bitrate = video_config.bitrate;
-    let min_bitrate = 15_000_000u32;  // 15 Mbps minimum (below this 4K is unwatchable)
+    let min_bitrate = if is_thunderbolt {
+        80_000_000u32 // Keep Thunderbolt sessions from degrading to visibly low quality.
+    } else {
+        15_000_000u32
+    };
     let max_bitrate = if is_thunderbolt {
-        4_000_000_000u32  // 4 Gbps for Thunderbolt (H.265 fallback only)
+        300_000_000u32  // Avoid unstable ultra-high bitrates.
     } else {
         80_000_000u32   // 80 Mbps for WiFi (802.11ac can handle this)
     };
     let mut current_bitrate = if is_thunderbolt {
-        initial_bitrate.max(200_000_000) // Start high for Thunderbolt
+        initial_bitrate.max(120_000_000).min(max_bitrate)
     } else {
         initial_bitrate
     };
     let mut last_bitrate_adjustment = tokio::time::Instant::now();
     let bitrate_adjustment_interval = tokio::time::Duration::from_secs(2);
+    let mut stats_last_log = tokio::time::Instant::now();
+    let stats_log_interval = tokio::time::Duration::from_secs(2);
+    let mut stats_frames_sent: u64 = 0;
+    let mut stats_bytes_sent: u64 = 0;
 
     info!("Server components initialized");
 
@@ -647,6 +716,8 @@ async fn handle_client(
                                     &packet,
                                 ).await {
                                     warn!("Failed to send raw video fragment: {}", e);
+                                } else {
+                                    stats_bytes_sent += chunk.len() as u64;
                                 }
 
                                 if i % 50 == 49 {
@@ -654,6 +725,7 @@ async fn handle_client(
                                 }
                             }
                             video_frame_number += 1;
+                            stats_frames_sent += 1;
                         }
                     }
                 } else if let Some(ref mut enc) = encoder {
@@ -703,6 +775,8 @@ async fn handle_client(
                                     &packet,
                                 ).await {
                                     warn!("Failed to send video fragment: {}", e);
+                                } else {
+                                    stats_bytes_sent += chunk.len() as u64;
                                 }
 
                                 if i % 50 == 49 {
@@ -710,12 +784,31 @@ async fn handle_client(
                                 }
                             }
                             video_frame_number += 1;
+                            stats_frames_sent += 1;
                         }
                     }
                 }
 
                 if frames_this_tick > 0 {
                     debug!("Processed {} frames this tick", frames_this_tick);
+                }
+
+                if stats_last_log.elapsed() >= stats_log_interval {
+                    let elapsed_s = stats_last_log.elapsed().as_secs_f64().max(0.001);
+                    let fps = stats_frames_sent as f64 / elapsed_s;
+                    let mbps = (stats_bytes_sent as f64 * 8.0) / elapsed_s / 1_000_000.0;
+                    info!(
+                        "Stream stats: capture={}x{} codec={:?} fps={:.1} tx={:.1} Mbps bitrate={} Mbps",
+                        capture_width,
+                        capture_height,
+                        capture_video_config.codec,
+                        fps,
+                        mbps,
+                        current_bitrate / 1_000_000
+                    );
+                    stats_last_log = tokio::time::Instant::now();
+                    stats_frames_sent = 0;
+                    stats_bytes_sent = 0;
                 }
 
                 // Process audio packets

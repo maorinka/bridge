@@ -19,6 +19,7 @@ use bridge_video::{MetalDisplay, VideoDecoder, DecodedFrame};
 use bridge_input::{CaptureConfig, InputCapturer};
 use bridge_audio::{PlaybackConfig, AudioPlayer, AudioPacket};
 use clap::Parser;
+use anyhow::anyhow;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -312,13 +313,15 @@ fn main() -> Result<()> {
 async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
     // Determine server address
     let server_addr = if let Some(server) = args.server {
-        server.parse::<SocketAddr>()
-            .unwrap_or_else(|_| {
+        match server.parse::<SocketAddr>() {
+            Ok(addr) => addr,
+            Err(_) => {
                 // Try adding default port
                 format!("{}:{}", server, DEFAULT_CONTROL_PORT)
                     .parse()
-                    .expect("Invalid server address")
-            })
+                    .map_err(|_| anyhow!("Invalid server address: {}", server))?
+            }
+        }
     } else {
         // Use service discovery
         info!("Searching for Bridge servers...");
@@ -364,10 +367,9 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
     // Connect to server — use larger packets and buffers for Thunderbolt
     let mut transport_config = TransportConfig::default();
     if is_thunderbolt {
-        transport_config.max_packet_size = bridge_common::MAX_UDP_PACKET_SIZE_THUNDERBOLT;
         transport_config.send_buffer_size = 64 * 1024 * 1024; // 64MB
         transport_config.recv_buffer_size = 64 * 1024 * 1024;
-        info!("Thunderbolt: packet_size=65507, socket_buffers=64MB");
+        info!("Thunderbolt: using MTU-safe packet size with 64MB socket buffers");
     }
     let mut conn = BridgeConnection::new(server_addr, transport_config);
 
