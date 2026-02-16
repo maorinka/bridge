@@ -119,14 +119,18 @@ impl VirtualDisplay {
             let settings_class = class!(CGVirtualDisplaySettings);
             let settings: Retained<AnyObject> = msg_send_id![settings_class, new];
 
-            let _: () = msg_send![&settings, setHiDPI: false];
+            // HiDPI (Retina) mode: macOS renders at half logical resolution
+            // with 2x backing pixels, producing crisp text and UI.
+            // e.g. 3840x2160 backing with 1920x1080 logical.
+            let _: () = msg_send![&settings, setHiDPI: true];
 
-            // Create display mode at native (1x) resolution
+            let logical_width = width / 2;
+            let logical_height = height / 2;
             let mode_class = class!(CGVirtualDisplayMode);
             let mode: Retained<AnyObject> = msg_send_id![
                 msg_send_id![mode_class, alloc],
-                initWithWidth: width as usize,
-                height: height as usize,
+                initWithWidth: logical_width as usize,
+                height: logical_height as usize,
                 refreshRate: refresh_rate as f64
             ];
 

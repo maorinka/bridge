@@ -8,6 +8,7 @@
 
 use screencapturekit::prelude::*;
 use screencapturekit::cm::SCFrameStatus;
+use screencapturekit::stream::configuration::SCCaptureResolutionType;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -170,7 +171,9 @@ impl SckBackend {
             .with_height(capture_height)
             .with_pixel_format(PixelFormat::BGRA)
             .with_minimum_frame_interval(&frame_interval)
-            .with_shows_cursor(config.show_cursor);
+            .with_shows_cursor(config.show_cursor)
+            .with_scales_to_fit(false)
+            .with_capture_resolution_type(SCCaptureResolutionType::Best);
 
         // Create handler
         let handler = SckHandler {
