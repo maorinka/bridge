@@ -124,6 +124,11 @@ impl VirtualDisplay {
             // e.g. 3840x2160 backing with 1920x1080 logical.
             let _: () = msg_send![&settings, setHiDPI: true];
 
+            if width % 2 != 0 || height % 2 != 0 {
+                return Err(BridgeError::Video(format!(
+                    "HiDPI requires even dimensions, got {}x{}", width, height
+                )));
+            }
             let logical_width = width / 2;
             let logical_height = height / 2;
             let mode_class = class!(CGVirtualDisplayMode);
@@ -152,7 +157,8 @@ impl VirtualDisplay {
                 fn CGDisplayPixelsWide(display: u32) -> usize;
                 fn CGDisplayPixelsHigh(display: u32) -> usize;
                 fn CGDisplayShowCursor(display: u32) -> i32;
-                fn CGWarpMouseCursorPosition(point: NSPoint) -> i32;
+                // Uses display-local coordinates (not global screen coords)
+                fn CGDisplayMoveCursorToPoint(display: u32, point: NSPoint) -> i32;
             }
             let mut ready = false;
             for attempt in 0..20 {
@@ -172,12 +178,15 @@ impl VirtualDisplay {
 
             // Ensure cursor is visible on the virtual display.
             // On headless setups the cursor is often hidden by default.
+            // Use CGDisplayMoveCursorToPoint (display-local coords) instead of
+            // CGWarpMouseCursorPosition (global coords) — the virtual display
+            // may not be at the global origin.
             CGDisplayShowCursor(display_id);
-            CGWarpMouseCursorPosition(NSPoint {
-                x: width as f64 / 2.0,
-                y: height as f64 / 2.0,
+            CGDisplayMoveCursorToPoint(display_id, NSPoint {
+                x: logical_width as f64 / 2.0,
+                y: logical_height as f64 / 2.0,
             });
-            info!("Cursor shown and warped to center of virtual display");
+            info!("Cursor shown and moved to center of virtual display (local coords)");
 
             Ok(Self {
                 _display: display,

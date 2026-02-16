@@ -150,13 +150,20 @@ impl SckBackend {
             &displays[0]
         };
 
+        // SCDisplay.width/height return POINTS (logical), not backing pixels.
+        // On HiDPI displays, backing pixels = 2x points (e.g. 1920x1080 pts → 3840x2160 px).
+        // Always prefer config.width/height (which carry the intended backing pixel resolution)
+        // over the display's point dimensions.
         let display_width = target_display.width();
         let display_height = target_display.height();
-        info!("SCK display: {}x{} (ID={})", display_width, display_height, target_display.display_id());
+        info!("SCK display: {}x{} points (ID={})", display_width, display_height, target_display.display_id());
 
-        // Determine capture resolution
         let capture_width = if config.width > 0 { config.width } else { display_width };
         let capture_height = if config.height > 0 { config.height } else { display_height };
+        if config.width > 0 && (config.width != display_width || config.height != display_height) {
+            info!("SCK: overriding display points {}x{} with backing pixel config {}x{}",
+                  display_width, display_height, capture_width, capture_height);
+        }
 
         // Create content filter — capture entire display
         let filter = SCContentFilter::create()
