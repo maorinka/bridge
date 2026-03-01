@@ -122,20 +122,27 @@ impl VirtualDisplay {
             let settings_class = class!(CGVirtualDisplaySettings);
             let settings: Retained<AnyObject> = msg_send![settings_class, new];
 
-            // Use native (non-HiDPI) mode at full pixel resolution.
-            // HiDPI=true on CGVirtualDisplay doesn't reliably produce 2x backing
-            // pixels — macOS renders at the logical resolution (e.g. 1920x1080)
-            // and SCK upscales, causing blurry output.
-            // Native 3840x2160 gives pixel-sharp capture at the cost of smaller
-            // UI elements (same as a non-Retina 4K monitor).
+            // Enable HiDPI (Retina) mode.
+            // CGVirtualDisplayMode's initWithWidth:height: specifies LOGICAL points,
+            // not backing pixels. With HiDPI=1, macOS creates a 2x Retina mode:
+            //   - Logical resolution: width/2 x height/2 (e.g., 1920x1080)
+            //   - Backing pixel resolution: width x height (e.g., 3840x2160)
+            // ScreenCaptureKit with SCCaptureResolutionType::Best captures the full
+            // backing resolution, giving crisp Retina-quality output.
             // ObjC BOOL is actually unsigned int on this API, not Rust bool
-            let _: () = msg_send![&settings, setHiDPI: 0u32];
+            let _: () = msg_send![&settings, setHiDPI: 1u32];
+
+            // Mode width/height are LOGICAL (points). For 4K HiDPI, use half-res mode.
+            let mode_width = width / 2;
+            let mode_height = height / 2;
+            info!("Creating HiDPI mode: {}x{} logical ({}x{} backing pixels)",
+                  mode_width, mode_height, width, height);
 
             let mode_class = class!(CGVirtualDisplayMode);
             let mode: Retained<AnyObject> = msg_send![
                 msg_send![mode_class, alloc],
-                initWithWidth: width,
-                height: height,
+                initWithWidth: mode_width,
+                height: mode_height,
                 refreshRate: refresh_rate as f64
             ];
 

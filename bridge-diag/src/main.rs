@@ -71,6 +71,9 @@ async fn main() {
         encoded_frames: 0,
     };
 
+    // Hold virtual display alive across sections so capture test can use it
+    let mut vd_holder: Option<VirtualDisplay> = None;
+
     // -----------------------------------------------------------------------
     // 1. Screen recording permission
     // -----------------------------------------------------------------------
@@ -152,19 +155,42 @@ async fn main() {
                     warn("Virtual display NOT found in display list (may not be fully registered)");
                 }
 
-                // Check CGDisplayPixelsWide
-                let (pw, ph) = unsafe {
+                // Check logical vs backing pixel resolution
+                let (logical_w, logical_h, pixel_w, pixel_h) = unsafe {
                     extern "C" {
                         fn CGDisplayPixelsWide(display: u32) -> usize;
                         fn CGDisplayPixelsHigh(display: u32) -> usize;
+                        fn CGDisplayCopyDisplayMode(display: u32) -> *const std::ffi::c_void;
+                        fn CGDisplayModeGetPixelWidth(mode: *const std::ffi::c_void) -> usize;
+                        fn CGDisplayModeGetPixelHeight(mode: *const std::ffi::c_void) -> usize;
+                        fn CGDisplayModeRelease(mode: *const std::ffi::c_void);
                     }
-                    (CGDisplayPixelsWide(vd.display_id()), CGDisplayPixelsHigh(vd.display_id()))
+                    let lw = CGDisplayPixelsWide(vd.display_id());
+                    let lh = CGDisplayPixelsHigh(vd.display_id());
+                    let mode = CGDisplayCopyDisplayMode(vd.display_id());
+                    let (pw, ph) = if !mode.is_null() {
+                        let w = CGDisplayModeGetPixelWidth(mode);
+                        let h = CGDisplayModeGetPixelHeight(mode);
+                        CGDisplayModeRelease(mode);
+                        (w, h)
+                    } else {
+                        (lw, lh)
+                    };
+                    (lw, lh, pw, ph)
                 };
-                info(&format!("CGDisplayPixelsWide/High: {}x{}", pw, ph));
+                info(&format!("Logical resolution:  {}x{} (CGDisplayPixelsWide/High)", logical_w, logical_h));
+                info(&format!("Backing pixels:      {}x{} (CGDisplayModeGetPixelWidth/Height)", pixel_w, pixel_h));
+                if pixel_w > logical_w {
+                    pass(&format!("HiDPI active: {}x scale", pixel_w / logical_w));
+                } else if pixel_w == logical_w && logical_w as u32 == vd.width() {
+                    pass("Native resolution matches requested (1x scale)");
+                } else {
+                    warn(&format!("Resolution mismatch: requested {}x{} but got {}x{} backing pixels",
+                        vd.width(), vd.height(), pixel_w, pixel_h));
+                }
 
-                info("Dropping virtual display...");
-                drop(vd);
-                pass("Virtual display released");
+                // Keep virtual display alive for capture test
+                vd_holder = Some(vd);
             }
             Err(e) => {
                 fail(&format!("Virtual display creation failed: {e}"));
@@ -174,7 +200,7 @@ async fn main() {
     }
 
     // -----------------------------------------------------------------------
-    // 4. Screen capture test
+    // 4. Screen capture test (captures virtual display if available)
     // -----------------------------------------------------------------------
     header("Screen Capture");
 
@@ -182,19 +208,35 @@ async fn main() {
         warn("Skipping capture test (no screen recording permission)");
         results.capture = None;
     } else {
-        // Pick a display to capture
+        // Prefer capturing the virtual display to test actual streaming resolution
         let displays = get_displays();
-        let capture_display = displays.iter().find(|d| d.is_main).or(displays.first());
+        let capture_display = if let Some(ref vd) = vd_holder {
+            let vd_disp = displays.iter().find(|d| d.id == vd.display_id());
+            if vd_disp.is_some() {
+                info("Capturing VIRTUAL display (simulates server streaming scenario)");
+            }
+            vd_disp.or_else(|| displays.iter().find(|d| d.is_main)).or(displays.first())
+        } else {
+            displays.iter().find(|d| d.is_main).or(displays.first())
+        };
 
         if let Some(display) = capture_display {
+            // If capturing virtual display, use explicit 3840x2160 (server does this too)
+            let is_vd = vd_holder.as_ref().map_or(false, |vd| vd.display_id() == display.id);
+            let (cap_w, cap_h) = if is_vd {
+                (3840u32, 2160u32)
+            } else {
+                (0, 0) // native
+            };
             info(&format!(
-                "Capturing display 0x{:08X}: {}x{}",
-                display.id, display.width, display.height
+                "Capturing display 0x{:08X}: {}x{} (config: {})",
+                display.id, display.width, display.height,
+                if is_vd { format!("explicit {}x{}", cap_w, cap_h) } else { "native".into() }
             ));
 
             let config = CaptureConfig {
-                width: 0, // native
-                height: 0,
+                width: cap_w,
+                height: cap_h,
                 fps: 60,
                 show_cursor: true,
                 capture_audio: false,
