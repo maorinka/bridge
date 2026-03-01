@@ -248,6 +248,12 @@ impl UdpChannel {
             return Err(BridgeError::Protocol("Invalid packet header".into()));
         }
 
+        let actual_payload = len - PacketHeader::SIZE;
+        if header.payload_len as usize != actual_payload {
+            warn!("Payload length mismatch: header says {} but datagram has {} bytes",
+                  header.payload_len, actual_payload);
+        }
+
         let data = Bytes::copy_from_slice(&buf[PacketHeader::SIZE..len]);
 
         trace!("Received {} bytes (seq: {}, type: {:?})", len, header.sequence, header.packet_type);
@@ -345,7 +351,7 @@ impl FrameSender {
             let frame_header = VideoFrameHeader {
                 frame_number: self.frame_number,
                 pts_us,
-                is_keyframe: is_keyframe && i == 0,
+                is_keyframe,
                 frame_size: data.len() as u32,
                 fragment_index: i as u16,
                 fragment_count: fragment_count as u16,

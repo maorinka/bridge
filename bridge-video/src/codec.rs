@@ -128,6 +128,8 @@ pub struct VideoEncoder {
     frame_rx: Receiver<EncodedFrame>,
     frame_count: Arc<AtomicU64>,
     _callback_ctx: Box<EncoderCallbackContext>,
+    /// When true, the next encode call will force a keyframe
+    force_keyframe: bool,
 }
 
 unsafe impl Send for VideoEncoder {}
@@ -204,6 +206,7 @@ impl VideoEncoder {
             frame_rx,
             frame_count,
             _callback_ctx: callback_ctx,
+            force_keyframe: false,
         };
 
         // Set all the low-latency properties
@@ -445,15 +448,40 @@ impl VideoEncoder {
             let pts = CMTimeStruct::new(frame.pts_us as i64, 1_000_000);
             let duration = CMTimeStruct::new(1_000_000 / self.config.fps as i64, 1_000_000);
 
+            // Build frame properties — force keyframe if requested
+            let frame_properties = if self.force_keyframe {
+                self.force_keyframe = false;
+                info!("Forcing keyframe on next encode");
+                let dict = CFDictionaryCreateMutable(
+                    kCFAllocatorDefault,
+                    1,
+                    ptr::null(),
+                    ptr::null(),
+                );
+                CFDictionarySetValue(
+                    dict,
+                    kVTEncodeFrameOptionKey_ForceKeyFrame,
+                    kCFBooleanTrue as CFTypeRef,
+                );
+                dict as CFDictionaryRef
+            } else {
+                ptr::null()
+            };
+
             let encode_status = VTCompressionSessionEncodeFrame(
                 self.session,
                 pixel_buffer,
                 pts,
                 duration,
-                ptr::null(),
+                frame_properties,
                 source_ref_con,
                 ptr::null_mut(),
             );
+
+            // Release frame properties dict if we created one
+            if !frame_properties.is_null() {
+                CFRelease(frame_properties as CFTypeRef);
+            }
 
             // Release the pixel buffer (encoder retains internally if needed)
             CVPixelBufferRelease(pixel_buffer);
@@ -554,10 +582,8 @@ impl VideoEncoder {
 
     /// Request a keyframe on next encode
     pub fn request_keyframe(&mut self) {
-        // This is handled by setting frame properties during encode
-        // For now, we just log - the actual implementation would require
-        // tracking state and passing it to the next encode call
-        debug!("Keyframe requested");
+        info!("Keyframe will be forced on next encode");
+        self.force_keyframe = true;
     }
 }
 
@@ -1093,7 +1119,10 @@ impl VideoDecoder {
             CFRelease(block_buffer as CFTypeRef);
 
             if decode_status != NO_ERR {
-                warn!("Decode failed with status: {} (frame {})", decode_status, frame.frame_number);
+                return Err(BridgeError::Video(format!(
+                    "VTDecompressionSessionDecodeFrame failed: {} (frame {})",
+                    decode_status, frame.frame_number
+                )));
             }
         }
 

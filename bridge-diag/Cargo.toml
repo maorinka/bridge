@@ -1,0 +1,11 @@
+[package]
+name = "bridge-diag"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bridge-common = { path = "../bridge-common" }
+bridge-video = { path = "../bridge-video" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

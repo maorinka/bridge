@@ -101,8 +101,9 @@ impl BridgeConnection {
         let audio_addr = SocketAddr::new(self.remote_addr.ip(), welcome.audio_port);
         let input_addr = SocketAddr::new(self.remote_addr.ip(), self.config.input_port);
 
-        self.video_channel = Some(UdpChannel::connect_with_buffers(video_addr, self.config.max_packet_size, self.config.send_buffer_size).await?);
-        self.audio_channel = Some(UdpChannel::connect_with_buffers(audio_addr, self.config.max_packet_size, self.config.send_buffer_size).await?);
+        // Client receives video/audio (use recv buffer), sends input (use send buffer)
+        self.video_channel = Some(UdpChannel::connect_with_buffers(video_addr, self.config.max_packet_size, self.config.recv_buffer_size).await?);
+        self.audio_channel = Some(UdpChannel::connect_with_buffers(audio_addr, self.config.max_packet_size, self.config.recv_buffer_size).await?);
         self.input_channel = Some(UdpChannel::connect_with_buffers(input_addr, self.config.max_packet_size, self.config.send_buffer_size).await?);
 
         self.video_config = Some(welcome.video_config.clone());
@@ -155,10 +156,10 @@ impl BridgeConnection {
 
         info!("Negotiated video config: {}x{} @ {}fps", video_config.width, video_config.height, video_config.fps);
 
-        // Set up UDP channels
+        // Set up UDP channels — server sends video/audio (send buffer), receives input (recv buffer)
         let mut video_channel = UdpChannel::bind_with_buffers(config.video_port, config.max_packet_size, config.send_buffer_size).await?;
         let mut audio_channel = UdpChannel::bind_with_buffers(config.audio_port, config.max_packet_size, config.send_buffer_size).await?;
-        let mut input_channel = UdpChannel::bind_with_buffers(config.input_port, config.max_packet_size, config.send_buffer_size).await?;
+        let mut input_channel = UdpChannel::bind_with_buffers(config.input_port, config.max_packet_size, config.recv_buffer_size).await?;
 
         // Restrict UDP channels to the same peer IP as the authenticated QUIC control channel.
         video_channel.set_allowed_remote_ip(remote_addr.ip());

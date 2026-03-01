@@ -17,7 +17,7 @@ use bridge_transport::{
 use bridge_video::{CaptureConfig, EncoderConfig, ScreenCapturer, VideoEncoder, get_displays, virtual_display::{VirtualDisplay, is_virtual_display_supported}};
 // TODO: Input disabled - focus on video first
 // use bridge_input::InputInjector;
-use bridge_audio::{AudioCaptureConfig, AudioCapturer};
+use bridge_audio::AudioCapturer;
 use clap::Parser;
 use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -100,9 +100,10 @@ async fn main() -> Result<()> {
     }
 
     // Set up video configuration
+    // width=0, height=0 means "use client's request" (no server override)
     let video_config = VideoConfig {
-        width: if args.width > 0 { args.width } else { 3840 },
-        height: if args.height > 0 { args.height } else { 2160 },
+        width: args.width,
+        height: args.height,
         fps: args.fps,
         codec: if args.raw_video {
             bridge_common::VideoCodec::Raw
@@ -186,9 +187,9 @@ async fn handle_client(
     control_conn: bridge_transport::QuicConnection,
     server_name: &str,
     config: TransportConfig,
-    _video_config: VideoConfig,
-    audio_config: AudioConfig,
-    no_audio: bool,
+    server_video_config: VideoConfig,
+    _audio_config: AudioConfig,
+    _no_audio: bool,
     strict_resolution: bool,
 ) -> Result<()> {
     let remote_addr = control_conn.remote_addr();
@@ -226,19 +227,38 @@ async fn handle_client(
     let max_packet_size = config.max_packet_size;
 
     // Accept with config negotiation
+    // Server CLI overrides (--width, --height, --fps, --bitrate) take priority over client request
     let (mut conn, hello) = BridgeConnection::accept_with_negotiation(
         control_conn,
         config,
         server_name,
         |hello| {
             let mut cfg = hello.video_config.clone();
+
+            // Apply server-side overrides if specified via CLI
+            if server_video_config.width > 0 && server_video_config.height > 0 {
+                info!("Server override: resolution {}x{} -> {}x{}",
+                      cfg.width, cfg.height, server_video_config.width, server_video_config.height);
+                cfg.width = server_video_config.width;
+                cfg.height = server_video_config.height;
+            }
+            if server_video_config.fps != 60 {
+                cfg.fps = server_video_config.fps;
+            }
+            if server_video_config.bitrate != 50_000_000 {
+                // Non-default bitrate from CLI
+                cfg.bitrate = server_video_config.bitrate;
+            }
+
             // For Thunderbolt connections, use H.265 at very high bitrate
             // Raw 4K60 BGRA = ~16 Gbps, exceeds Thunderbolt IP's ~10 Gbps limit
             // H.265 at 200 Mbps looks near-perfect and fits easily
             if is_thunderbolt {
                 cfg.codec = bridge_common::VideoCodec::H265;
-                cfg.bitrate = 200_000_000; // 200 Mbps - high quality with better packet stability
-                info!("Thunderbolt: using H.265 at 200 Mbps");
+                if cfg.bitrate < 120_000_000 {
+                    cfg.bitrate = 200_000_000; // 200 Mbps minimum for Thunderbolt
+                }
+                info!("Thunderbolt: using H.265 at {} Mbps", cfg.bitrate / 1_000_000);
             }
 
             // If virtual displays are unavailable and requested resolution differs from native,
@@ -389,19 +409,8 @@ async fn handle_client(
         None
     };
 
-    let mut audio_capturer: Option<AudioCapturer> = if no_audio {
-        info!("Audio capture disabled");
-        None
-    } else {
-        let audio_capture_config = AudioCaptureConfig::from(&audio_config);
-        match AudioCapturer::new(audio_capture_config) {
-            Ok(capturer) => Some(capturer),
-            Err(e) => {
-                warn!("Audio capture unavailable: {}. Continuing without audio.", e);
-                None
-            }
-        }
-    };
+    // Audio disabled — focusing on video first
+    let mut audio_capturer: Option<AudioCapturer> = None;
 
     // TODO: Input disabled - focus on video first
     // let mut input_injector = InputInjector::new()?;
@@ -471,31 +480,7 @@ async fn handle_client(
         }
     }
 
-    // Poll for audio ping
-    if let Some(audio_ch) = conn.audio_channel() {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-        loop {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(50),
-                audio_ch.recv()
-            ).await {
-                Ok(Ok((header, _))) => {
-                    debug!("Received audio ping from client (type: {:?})", header.packet_type);
-                    break;
-                }
-                Ok(Err(e)) => {
-                    warn!("Error receiving audio ping: {}", e);
-                    break;
-                }
-                Err(_) => {
-                    if tokio::time::Instant::now() > deadline {
-                        warn!("Timeout waiting for audio ping");
-                        break;
-                    }
-                }
-            }
-        }
-    }
+    // Audio ping skipped — audio disabled
 
     // TODO: Input disabled - focus on video first
     // if let Some(input_ch) = conn.input_channel() {
@@ -525,13 +510,35 @@ async fn handle_client(
 
     info!("UDP channels initialized");
 
+    // Spawn a dedicated control reader task (recv_control is NOT cancel-safe in select!)
+    let server_recv_stream = conn.control()
+        .and_then(|ctrl| ctrl.take_recv_stream())
+        .ok_or_else(|| anyhow::anyhow!("No control channel"))?;
+    let (server_control_tx, mut server_control_rx) = tokio::sync::mpsc::unbounded_channel::<ControlMessage>();
+    tokio::spawn(async move {
+        let mut stream = server_recv_stream;
+        loop {
+            match bridge_transport::QuicConnection::recv_control_from_stream(&mut stream).await {
+                Ok(msg) => {
+                    if server_control_tx.send(msg).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!("Control channel read error: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+
     // Main server loop
     loop {
-        // Handle control messages
+        // Handle control messages (from cancel-safe mpsc channel)
         tokio::select! {
-            control_result = conn.recv_control() => {
+            control_result = server_control_rx.recv() => {
                 match control_result {
-                    Ok(msg) => {
+                    Some(msg) => {
                         match msg {
                             ControlMessage::StartStream => {
                                 info!("Client requested stream start");
@@ -611,8 +618,8 @@ async fn handle_client(
                             _ => {}
                         }
                     }
-                    Err(e) => {
-                        error!("Control channel error: {}", e);
+                    None => {
+                        error!("Control channel closed");
                         break;
                     }
                 }
@@ -750,7 +757,7 @@ async fn handle_client(
                                 let frame_header = VideoFrameHeader {
                                     frame_number: video_frame_number,
                                     pts_us: encoded.pts_us,
-                                    is_keyframe: encoded.is_keyframe && i == 0,
+                                    is_keyframe: encoded.is_keyframe,
                                     frame_size: data.len() as u32,
                                     fragment_index: i as u16,
                                     fragment_count: fragment_count as u16,

@@ -110,6 +110,7 @@ extern "C" {
     pub static kVTCompressionPropertyKey_MaxKeyFrameInterval: CFStringRef;
     pub static kVTCompressionPropertyKey_MaxFrameDelayCount: CFStringRef;
     pub static kVTCompressionPropertyKey_ProfileLevel: CFStringRef;
+    pub static kVTEncodeFrameOptionKey_ForceKeyFrame: CFStringRef;
     pub static kVTProfileLevel_HEVC_Main_AutoLevel: CFStringRef;
     pub static kVTProfileLevel_HEVC_Main10_AutoLevel: CFStringRef;
     pub static kVTProfileLevel_H264_Main_AutoLevel: CFStringRef;

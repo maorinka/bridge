@@ -17,7 +17,7 @@ use bridge_video::{MetalDisplay, VideoDecoder, DecodedFrame};
 // TODO: Input disabled - focus on video first
 #[allow(unused_imports)]
 use bridge_input::{CaptureConfig, InputCapturer};
-use bridge_audio::{PlaybackConfig, AudioPlayer, AudioPacket};
+use bridge_audio::{AudioPlayer, AudioPacket};
 use clap::Parser;
 use anyhow::anyhow;
 use std::collections::HashMap;
@@ -101,14 +101,9 @@ impl FrameReassembler {
             pending.fragments[idx] = Some(data);
             pending.received_count += 1;
 
-            // Fragment 0 carries the is_keyframe flag - update it when we receive it
-            // This handles out-of-order UDP packet delivery
-            if header.fragment_index == 0 {
-                if header.is_keyframe {
-                    debug!("Received keyframe fragment 0 for frame {} ({} fragments total)",
-                           header.frame_number, header.fragment_count);
-                    pending.header.is_keyframe = true;
-                }
+            // All fragments carry the is_keyframe flag now
+            if header.is_keyframe {
+                pending.header.is_keyframe = true;
             }
         }
 
@@ -187,7 +182,15 @@ fn create_window(mtm: MainThreadMarker, width: u32, height: u32, fullscreen: boo
             NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width as f64, height as f64))
         }
     } else {
-        NSRect::new(NSPoint::new(100.0, 100.0), NSSize::new(width as f64, height as f64))
+        // On Retina displays, window dimensions are in points (not pixels).
+        // Divide by screen backing scale to get a window that's exactly
+        // width x height pixels.
+        let scale = NSScreen::mainScreen(mtm)
+            .map(|s| s.backingScaleFactor())
+            .unwrap_or(1.0);
+        let pt_w = width as f64 / scale;
+        let pt_h = height as f64 / scale;
+        NSRect::new(NSPoint::new(100.0, 100.0), NSSize::new(pt_w, pt_h))
     };
 
     // Create window
@@ -256,6 +259,11 @@ fn create_window(mtm: MainThreadMarker, width: u32, height: u32, fullscreen: boo
 // Import NSScreen
 use objc2_app_kit::NSScreen;
 
+/// Maximum number of reconnection attempts before giving up
+const MAX_RECONNECT_ATTEMPTS: u32 = 10;
+/// Delay between reconnection attempts
+const RECONNECT_DELAY_MS: u64 = 2000;
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -295,15 +303,48 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
 
-    // Run the async main logic
-    let result = runtime.block_on(async_main(args, mtm));
-
-    result
+    // Run with auto-reconnect (only for transport/connection errors, not startup failures)
+    runtime.block_on(async {
+        let mut attempt = 0u32;
+        loop {
+            match async_main(&args, mtm).await {
+                Ok(()) => {
+                    info!("Session ended cleanly");
+                    break Ok(());
+                }
+                Err(e) => {
+                    // Check if this is a transient transport error worth retrying.
+                    // Don't retry permanent failures like bad args, init errors, etc.
+                    let msg = e.to_string();
+                    let is_transient = msg.contains("channel failed")
+                        || msg.contains("channel lost")
+                        || msg.contains("connection")
+                        || msg.contains("Connection")
+                        || msg.contains("timeout")
+                        || msg.contains("Timeout")
+                        || msg.contains("reset")
+                        || msg.contains("broken pipe");
+                    if !is_transient {
+                        error!("Fatal error (not retrying): {}", e);
+                        break Err(e);
+                    }
+                    attempt += 1;
+                    if attempt >= MAX_RECONNECT_ATTEMPTS {
+                        error!("Max reconnect attempts ({}) reached, giving up: {}", MAX_RECONNECT_ATTEMPTS, e);
+                        break Err(e);
+                    }
+                    warn!("Session failed (attempt {}/{}): {}. Reconnecting in {}ms...",
+                          attempt, MAX_RECONNECT_ATTEMPTS, e, RECONNECT_DELAY_MS);
+                    tokio::time::sleep(std::time::Duration::from_millis(RECONNECT_DELAY_MS)).await;
+                }
+            }
+        }
+    })
 }
 
-async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
+async fn async_main(args: &Args, mtm: MainThreadMarker) -> Result<()> {
     // Determine server address
-    let server_addr = if let Some(server) = args.server {
+    let server_addr = if let Some(ref server) = args.server {
         match server.parse::<SocketAddr>() {
             Ok(addr) => addr,
             Err(_) => {
@@ -321,16 +362,16 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
 
     info!("Connecting to server at {}", server_addr);
 
-    // Detect local display resolution to request from server
+    // Detect local display resolution to request matching capture from server
     let displays = bridge_video::get_displays();
     let main_display = displays.iter().find(|d| d.is_main).or_else(|| displays.first());
     let (display_width, display_height) = match main_display {
         Some(d) => {
-            info!("Detected display: {}x{}", d.width, d.height);
+            info!("Detected local display: {}x{} (native pixels)", d.width, d.height);
             (d.width, d.height)
         }
         None => {
-            warn!("Could not detect display, using 1920x1080");
+            warn!("Could not detect display, defaulting to 1920x1080");
             (1920, 1080)
         }
     };
@@ -377,7 +418,7 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
     );
 
     let video_config = welcome.video_config;
-    let audio_config = welcome.audio_config;
+    let _audio_config = welcome.audio_config;
 
     // Send ping packets on UDP channels so server learns our address
     // Retry multiple times to handle race condition where server may not be ready yet
@@ -391,11 +432,7 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
                 error!("Failed to send video ping: {}", e);
             }
         }
-        if let Some(audio_ch) = conn.audio_channel() {
-            if let Err(e) = audio_ch.send(bridge_common::PacketType::Audio, b"ping").await {
-                error!("Failed to send audio ping: {}", e);
-            }
-        }
+        // Audio ping skipped — audio disabled
         // TODO: Input disabled - focus on video first
         // if let Some(input_ch) = conn.input_channel() {
         //     if let Err(e) = input_ch.send(bridge_common::PacketType::Input, b"ping").await {
@@ -405,14 +442,15 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
     }
     debug!("UDP pings sent (10 attempts over 900ms)");
 
-    // Create window with Metal layer - use native resolution for now
-    // The actual frame size may differ from requested
+    // Create window — use received config dimensions (server may have negotiated different resolution)
     let fullscreen = !args.windowed;
-    let (_window, metal_layer) = create_window(mtm, display_width, display_height, fullscreen);
-    info!("Window created: {}x{}, fullscreen={}", display_width, display_height, fullscreen);
+    let window_w = video_config.width;
+    let window_h = video_config.height;
+    let (_window, metal_layer) = create_window(mtm, window_w, window_h, fullscreen);
+    info!("Window created: {}x{}, fullscreen={}", window_w, window_h, fullscreen);
 
-    // Initialize display with local screen size - will render frames scaled
-    let mut display = MetalDisplay::new(display_width, display_height)?;
+    // Initialize display with negotiated video resolution
+    let mut display = MetalDisplay::new(video_config.width, video_config.height)?;
     display.set_layer(metal_layer);
     info!("Metal display initialized with layer");
 
@@ -422,22 +460,8 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
     let mut _actual_frame_width: Option<u32> = None;
     let mut _actual_frame_height: Option<u32> = None;
 
-    let playback_config = PlaybackConfig::from(&audio_config);
-    let mut player: Option<AudioPlayer> = match AudioPlayer::new(playback_config) {
-        Ok(mut p) => {
-            match p.start() {
-                Ok(_) => Some(p),
-                Err(e) => {
-                    warn!("Audio playback start failed: {}. Continuing without audio.", e);
-                    None
-                }
-            }
-        }
-        Err(e) => {
-            warn!("Audio player unavailable: {}. Continuing without audio.", e);
-            None
-        }
-    };
+    // Audio disabled — focusing on video first
+    let mut player: Option<AudioPlayer> = None;
 
     // TODO: Input capture disabled - focus on video first
     let _input_capturer: Option<InputCapturer> = None;
@@ -455,7 +479,32 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
 
     info!("Client components initialized");
 
-    // Request stream start
+    // Spawn a dedicated task to read control messages.
+    // recv_control() is NOT cancel-safe (two separate read_exact calls),
+    // so we can't use it in tokio::select!. Instead, take the recv stream
+    // and run a continuous reader that feeds an mpsc channel.
+    let recv_stream = conn.control()
+        .and_then(|ctrl| ctrl.take_recv_stream())
+        .ok_or_else(|| anyhow!("No control channel"))?;
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel::<ControlMessage>();
+    tokio::spawn(async move {
+        let mut stream = recv_stream;
+        loop {
+            match bridge_transport::QuicConnection::recv_control_from_stream(&mut stream).await {
+                Ok(msg) => {
+                    if control_tx.send(msg).is_err() {
+                        break; // main loop dropped receiver
+                    }
+                }
+                Err(e) => {
+                    warn!("Control channel read error: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+
+    // Request stream start (send_control still works — only recv was taken)
     conn.send_control(ControlMessage::StartStream).await?;
     info!("Stream started");
 
@@ -485,32 +534,9 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .expect("Failed to set up SIGINT handler");
 
-    let mut shutdown_requested = false;
-
-    // Main client loop
+    // Main client loop — event-driven with tokio::select!
     loop {
-        // Check for shutdown signals (non-blocking)
-        tokio::select! {
-            biased;
-
-            _ = sigterm.recv() => {
-                info!("Received SIGTERM, gracefully disconnecting...");
-                shutdown_requested = true;
-            }
-            _ = sigint.recv() => {
-                info!("Received SIGINT, gracefully disconnecting...");
-                shutdown_requested = true;
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_micros(1)) => {
-                // Continue with normal processing
-            }
-        }
-
-        if shutdown_requested {
-            break;
-        }
-
-        // Process macOS events to keep the window responsive
+        // Process macOS events first (non-blocking) to keep the window responsive
         unsafe {
             let app = NSApplication::sharedApplication(mtm);
             loop {
@@ -528,6 +554,41 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
             app.updateWindows();
         }
 
+        // Wait for video data, control messages, or signals
+        // Use select! to avoid busy-polling — wakes on first available event.
+        // control_rx.recv() is cancel-safe (mpsc channel), unlike raw recv_control().
+        tokio::select! {
+            biased;
+
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM, gracefully disconnecting...");
+                break;
+            }
+            _ = sigint.recv() => {
+                info!("Received SIGINT, gracefully disconnecting...");
+                break;
+            }
+            msg = control_rx.recv() => {
+                match msg {
+                    Some(ControlMessage::Disconnect) => {
+                        info!("Server sent Disconnect, ending session");
+                        break;
+                    }
+                    Some(other) => {
+                        debug!("Control message from server: {:?}", other);
+                    }
+                    None => {
+                        // Reader task exited — control channel lost
+                        warn!("Control channel closed, reconnecting...");
+                        return Err(anyhow!("Control channel lost"));
+                    }
+                }
+            }
+            // Wake every 8ms to pump macOS events even when no data arrives
+            // (60fps = 16.7ms per frame, so 8ms gives responsive UI + catches frames quickly)
+            _ = tokio::time::sleep(std::time::Duration::from_millis(8)) => {}
+        }
+
         // Receive video frames — drain all available packets, decode all, render only latest
         if let Some(video_ch) = conn.video_channel() {
             let mut packets_this_round = 0u32;
@@ -535,8 +596,10 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
 
             // Phase 1: Drain all available packets and collect complete frames
             loop {
+                // Short timeout: we already waited in the select! above,
+                // so just drain what's available without blocking long
                 let recv_result = tokio::time::timeout(
-                    std::time::Duration::from_millis(if packets_this_round == 0 { 10 } else { 0 }),
+                    std::time::Duration::from_millis(if packets_this_round == 0 { 2 } else { 0 }),
                     video_ch.recv()
                 ).await;
 
@@ -573,9 +636,8 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
                         }
                     }
                     Ok(Err(e)) => {
-                        error!("Video receive error: {}", e);
-                        shutdown_requested = true;
-                        break;
+                        error!("Video channel error: {}", e);
+                        return Err(anyhow!("Video channel failed: {}", e));
                     }
                     Err(_) => break,
                 }
@@ -617,9 +679,22 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
                         is_keyframe: complete_header.is_keyframe,
                         frame_number: complete_header.frame_number,
                     };
-                    dec.decode(&encoded)?;
-                    // Only retrieve decoded output for the last frame (saves work)
-                    if is_last { dec.recv_frame() } else { let _ = dec.recv_frame(); None }
+                    match dec.decode(&encoded) {
+                        Ok(()) => {
+                            // Only retrieve decoded output for the last frame (saves work)
+                            if is_last { dec.recv_frame() } else { let _ = dec.recv_frame(); None }
+                        }
+                        Err(e) => {
+                            warn!("Decode error on frame {}: {} — requesting keyframe",
+                                  complete_header.frame_number, e);
+                            if last_keyframe_request.elapsed() > std::time::Duration::from_secs(1) {
+                                let _ = conn.send_control(ControlMessage::RequestKeyframe).await;
+                                last_keyframe_request = tokio::time::Instant::now();
+                            }
+                            // Don't call recv_frame after decode error — would get stale output
+                            None
+                        }
+                    }
                 } else if is_last {
                     Some(DecodedFrame {
                         data: complete_data,
@@ -747,8 +822,6 @@ async fn async_main(args: Args, mtm: MainThreadMarker) -> Result<()> {
             dropped_frames = 0;
         }
 
-        // Small yield
-        tokio::task::yield_now().await;
     }
 
     // Clean up

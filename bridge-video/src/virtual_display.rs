@@ -46,9 +46,11 @@ impl VirtualDisplay {
             let name = NSString::from_str("Bridge Virtual Display");
             let _: () = msg_send![&descriptor, setName: &*name];
 
-            // Dispatch queue — use global high-priority queue (Chromium does this)
+            // Dispatch queue — use global high-priority queue (Chromium does this).
+            // dispatch_queue_t is toll-free bridged to NSObject, so cast to *const AnyObject
+            // for the objc2 msg_send! macro which expects ObjC types.
             extern "C" {
-                fn dispatch_get_global_queue(identifier: isize, flags: usize) -> *mut std::ffi::c_void;
+                fn dispatch_get_global_queue(identifier: isize, flags: usize) -> *const AnyObject;
             }
             const QOS_CLASS_USER_INTERACTIVE: isize = 0x21;
             let queue = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
@@ -58,8 +60,9 @@ impl VirtualDisplay {
             let _: () = msg_send![&descriptor, setQueue: queue];
 
             // Max pixel dimensions — required for macOS 14+
-            let _: () = msg_send![&descriptor, setMaxPixelsWide: width as usize];
-            let _: () = msg_send![&descriptor, setMaxPixelsHigh: height as usize];
+            // These properties are unsigned int (u32), not NSUInteger
+            let _: () = msg_send![&descriptor, setMaxPixelsWide: width];
+            let _: () = msg_send![&descriptor, setMaxPixelsHigh: height];
 
             // Physical size in millimeters — derived from resolution / PPI
             // Without this, macOS may reject the display for exceeding pixel density limits
@@ -125,13 +128,14 @@ impl VirtualDisplay {
             // and SCK upscales, causing blurry output.
             // Native 3840x2160 gives pixel-sharp capture at the cost of smaller
             // UI elements (same as a non-Retina 4K monitor).
-            let _: () = msg_send![&settings, setHiDPI: false];
+            // ObjC BOOL is actually unsigned int on this API, not Rust bool
+            let _: () = msg_send![&settings, setHiDPI: 0u32];
 
             let mode_class = class!(CGVirtualDisplayMode);
             let mode: Retained<AnyObject> = msg_send![
                 msg_send![mode_class, alloc],
-                initWithWidth: width as usize,
-                height: height as usize,
+                initWithWidth: width,
+                height: height,
                 refreshRate: refresh_rate as f64
             ];
 

@@ -17,7 +17,7 @@ use tracing::{debug, error, info, warn};
 pub struct QuicConnection {
     connection: Connection,
     send_stream: SendStream,
-    recv_stream: RecvStream,
+    recv_stream: Option<RecvStream>,
 }
 
 impl QuicConnection {
@@ -51,7 +51,7 @@ impl QuicConnection {
         Ok(Self {
             connection,
             send_stream,
-            recv_stream,
+            recv_stream: Some(recv_stream),
         })
     }
 
@@ -66,7 +66,7 @@ impl QuicConnection {
         Ok(Self {
             connection,
             send_stream,
-            recv_stream,
+            recv_stream: Some(recv_stream),
         })
     }
 
@@ -97,11 +97,22 @@ impl QuicConnection {
         Ok(())
     }
 
-    /// Receive a control message
+    /// Receive a control message.
+    /// NOTE: This method is NOT cancel-safe (two separate read_exact calls).
+    /// Do not use inside tokio::select!. Use `take_recv_stream()` + a dedicated
+    /// reader task with `recv_control_from_stream()` instead.
     pub async fn recv_control(&mut self) -> BridgeResult<ControlMessage> {
+        let recv_stream = self.recv_stream.as_mut()
+            .ok_or_else(|| BridgeError::Transport("Recv stream was taken".into()))?;
+        Self::recv_control_from_stream(recv_stream).await
+    }
+
+    /// Receive a control message from a raw RecvStream.
+    /// Same cancel-safety caveat as `recv_control`.
+    pub async fn recv_control_from_stream(recv_stream: &mut RecvStream) -> BridgeResult<ControlMessage> {
         // Read length prefix
         let mut len_buf = [0u8; 4];
-        self.recv_stream
+        recv_stream
             .read_exact(&mut len_buf)
             .await
             .map_err(|e| BridgeError::Transport(format!("Receive failed: {}", e)))?;
@@ -115,7 +126,7 @@ impl QuicConnection {
 
         // Read message data
         let mut data = vec![0u8; len];
-        self.recv_stream
+        recv_stream
             .read_exact(&mut data)
             .await
             .map_err(|e| BridgeError::Transport(format!("Receive failed: {}", e)))?;
@@ -125,6 +136,14 @@ impl QuicConnection {
         debug!("Received control message: {:?}", std::mem::discriminant(&msg));
 
         Ok(msg)
+    }
+
+    /// Take the recv stream for use in a dedicated reader task.
+    /// After calling this, `recv_control()` will always fail.
+    /// This is needed because `recv_control()` is not cancel-safe
+    /// (it does two separate `read_exact` calls).
+    pub fn take_recv_stream(&mut self) -> Option<RecvStream> {
+        self.recv_stream.take()
     }
 
     /// Close the connection
