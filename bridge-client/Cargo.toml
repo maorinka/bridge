@@ -37,5 +37,8 @@ core-graphics-types = "0.1"
 # Metal rendering
 metal = { workspace = true }
 
+# Compression
+lz4_flex = "0.11"
+
 # CLI
 clap = { version = "4.5", features = ["derive"] }

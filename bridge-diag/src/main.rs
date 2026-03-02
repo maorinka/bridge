@@ -91,9 +91,11 @@ async fn main() {
             pass("Screen recording permission granted (after request)");
             results.permission = true;
         } else {
-            fail("Screen recording permission denied");
-            info("Go to System Settings > Privacy & Security > Screen Recording");
-            info("and enable permission for this terminal/app.");
+            warn("CGPreflightScreenCaptureAccess returned false");
+            info("Will attempt capture anyway (macOS 15+ may grant at capture time)");
+            // On macOS 15+, permission is sometimes only checked at capture time,
+            // not by the preflight API. Force permission=true to attempt capture.
+            results.permission = true;
         }
     }
 

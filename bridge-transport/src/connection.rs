@@ -122,7 +122,7 @@ impl BridgeConnection {
         config: TransportConfig,
         server_name: &str,
     ) -> BridgeResult<(Self, HelloMessage)> {
-        Self::accept_with_negotiation(control, config, server_name, |hello| hello.video_config.clone()).await
+        Self::accept_with_negotiation(control, config, server_name, None, |hello| hello.video_config.clone()).await
     }
 
     /// Accept a connection with config negotiation
@@ -131,6 +131,7 @@ impl BridgeConnection {
         control: QuicConnection,
         config: TransportConfig,
         server_name: &str,
+        tcp_video_port: Option<u16>,
         negotiate_config: F,
     ) -> BridgeResult<(Self, HelloMessage)>
     where
@@ -173,6 +174,7 @@ impl BridgeConnection {
             audio_config: audio_config.clone(),
             video_port: config.video_port,
             audio_port: config.audio_port,
+            tcp_video_port,
         };
 
         control.send_control(ControlMessage::Welcome(welcome)).await?;

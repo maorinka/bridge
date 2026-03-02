@@ -136,6 +136,8 @@ pub struct WelcomeMessage {
     pub video_port: u16,
     /// UDP port for audio stream
     pub audio_port: u16,
+    /// TCP port for video stream (used for Thunderbolt+LZ4 mode)
+    pub tcp_video_port: Option<u16>,
 }
 
 // ============================================================================
@@ -177,6 +179,8 @@ impl Default for VideoConfig {
 pub enum VideoCodec {
     /// Raw uncompressed (for testing/Thunderbolt)
     Raw,
+    /// LZ4-compressed raw BGRA (pixel-perfect, for Thunderbolt)
+    RawLz4,
     /// H.264/AVC
     H264,
     /// H.265/HEVC (preferred)

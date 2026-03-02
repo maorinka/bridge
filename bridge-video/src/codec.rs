@@ -145,12 +145,12 @@ impl VideoEncoder {
             match config.codec {
                 VideoCodec::H264 => "H.264",
                 VideoCodec::H265 => "H.265",
-                VideoCodec::Raw => "Raw",
+                VideoCodec::Raw | VideoCodec::RawLz4 => "Raw",
             },
             config.bitrate
         );
 
-        if config.codec == VideoCodec::Raw {
+        if config.codec == VideoCodec::Raw || config.codec == VideoCodec::RawLz4 {
             return Err(BridgeError::Video("Raw codec doesn't need encoder".into()));
         }
 
@@ -160,7 +160,7 @@ impl VideoEncoder {
         let codec_type = match config.codec {
             VideoCodec::H264 => K_CM_VIDEO_CODEC_TYPE_H264,
             VideoCodec::H265 => K_CM_VIDEO_CODEC_TYPE_HEVC,
-            VideoCodec::Raw => unreachable!(),
+            VideoCodec::Raw | VideoCodec::RawLz4 => unreachable!(),
         };
 
         let drop_count = Arc::new(AtomicU64::new(0));
@@ -211,18 +211,22 @@ impl VideoEncoder {
 
         // Set all the low-latency properties
         unsafe {
-            // Set bitrate
-            let bitrate_num = cf_number_create_i64(config.bitrate as i64);
-            let status = VTSessionSetProperty(
-                encoder.session as *mut c_void,
-                kVTCompressionPropertyKey_AverageBitRate,
-                bitrate_num,
-            );
-            CFRelease(bitrate_num);
-            if status != NO_ERR {
-                warn!("Failed to set bitrate: {}", status);
+            // Set bitrate — skip for max_quality mode (uses constant quality instead)
+            if !config.max_quality {
+                let bitrate_num = cf_number_create_i64(config.bitrate as i64);
+                let status = VTSessionSetProperty(
+                    encoder.session as *mut c_void,
+                    kVTCompressionPropertyKey_AverageBitRate,
+                    bitrate_num,
+                );
+                CFRelease(bitrate_num);
+                if status != NO_ERR {
+                    warn!("Failed to set bitrate: {}", status);
+                } else {
+                    info!("  Bitrate: {} Mbps", config.bitrate / 1_000_000);
+                }
             } else {
-                info!("  Bitrate: {} Mbps", config.bitrate / 1_000_000);
+                info!("  Bitrate: uncapped (constant quality mode)");
             }
 
             // Set expected frame rate
@@ -299,7 +303,7 @@ impl VideoEncoder {
                 (VideoCodec::H265, true) => kVTProfileLevel_HEVC_Main10_AutoLevel,
                 (VideoCodec::H265, false) => kVTProfileLevel_HEVC_Main_AutoLevel,
                 (VideoCodec::H264, _) => kVTProfileLevel_H264_Main_AutoLevel,
-                (VideoCodec::Raw, _) => ptr::null(),
+                (VideoCodec::Raw | VideoCodec::RawLz4, _) => ptr::null(),
             };
             if !profile.is_null() {
                 let status = VTSessionSetProperty(
@@ -312,14 +316,30 @@ impl VideoEncoder {
                 }
             }
 
-            // For max quality mode: use DataRateLimits to allow high burst rates
-            // Note: We do NOT set Quality=1.0 because it makes the encoder prioritize
-            // quality over speed, adding significant latency. High bitrate alone gives
-            // excellent quality without the latency penalty.
+            // For max quality mode (Thunderbolt): set Quality=1.0 for near-lossless output.
+            // Combined with no AverageBitRate, this puts VT in constant-quality mode
+            // where it uses whatever bandwidth is needed. Over Thunderbolt (~10 Gbps)
+            // we have plenty of headroom.
             if config.max_quality {
-                // DataRateLimits: allow burst up to 4x average bitrate per second
-                // Format: CFArray of [bytes_per_period: CFNumber, period_seconds: CFNumber]
-                let burst_bytes = (config.bitrate as i64 * 4) / 8; // 4x bitrate in bytes
+                let quality_num = cf_number_create_f64(1.0);
+                let status = VTSessionSetProperty(
+                    encoder.session as *mut c_void,
+                    kVTCompressionPropertyKey_Quality,
+                    quality_num,
+                );
+                CFRelease(quality_num);
+                if status != NO_ERR {
+                    warn!("Failed to set quality: {}", status);
+                } else {
+                    info!("  Quality: 1.0 (constant quality, near-lossless)");
+                }
+            }
+
+            // In max_quality mode: no DataRateLimits — let VT use whatever bandwidth
+            // constant quality needs. Over Thunderbolt we have ~10 Gbps headroom.
+            // For non-max_quality, set DataRateLimits as a burst cap.
+            if !config.max_quality {
+                let burst_bytes = (config.bitrate as i64 * 2) / 8; // 2x bitrate in bytes
                 let burst_num = cf_number_create_i64(burst_bytes);
                 let period_num = cf_number_create_f64(1.0); // 1 second period
                 if !burst_num.is_null() && !period_num.is_null() {
@@ -674,13 +694,13 @@ extern "C" fn encoder_output_callback(
                     let nal_type = match ctx.codec {
                         VideoCodec::H265 => (data[offset + 4] >> 1) & 0x3F,
                         VideoCodec::H264 => data[offset + 4] & 0x1F,
-                        VideoCodec::Raw => 0,
+                        VideoCodec::Raw | VideoCodec::RawLz4 => 0,
                     };
 
                     let is_idr = match ctx.codec {
                         VideoCodec::H265 => nal_type >= 19 && nal_type <= 21, // IDR_W_RADL, IDR_N_LP, CRA
                         VideoCodec::H264 => nal_type == 5, // IDR
-                        VideoCodec::Raw => false,
+                        VideoCodec::Raw | VideoCodec::RawLz4 => false,
                     };
 
                     if is_idr {
@@ -785,7 +805,7 @@ unsafe fn extract_and_prepend_parameter_sets(
                 }
             }
         }
-        VideoCodec::Raw => {}
+        VideoCodec::Raw | VideoCodec::RawLz4 => {}
     }
 
     // Append original frame data
@@ -828,11 +848,11 @@ impl VideoDecoder {
             match codec {
                 VideoCodec::H264 => "H.264",
                 VideoCodec::H265 => "H.265",
-                VideoCodec::Raw => "Raw",
+                VideoCodec::Raw | VideoCodec::RawLz4 => "Raw",
             }
         );
 
-        if codec == VideoCodec::Raw {
+        if codec == VideoCodec::Raw || codec == VideoCodec::RawLz4 {
             return Err(BridgeError::Video("Raw codec doesn't need decoder".into()));
         }
 
@@ -918,7 +938,7 @@ impl VideoDecoder {
                     }
                     desc
                 }
-                VideoCodec::Raw => unreachable!(),
+                VideoCodec::Raw | VideoCodec::RawLz4 => unreachable!(),
             };
 
             self.format_desc = format_desc;
@@ -1149,7 +1169,7 @@ impl VideoDecoder {
         match codec {
             VideoCodec::H264 => Self::extract_h264_params(&nal_units),
             VideoCodec::H265 => Self::extract_h265_params(&nal_units),
-            VideoCodec::Raw => None,
+            VideoCodec::Raw | VideoCodec::RawLz4 => None,
         }
     }
 
@@ -1186,7 +1206,7 @@ impl VideoDecoder {
                         // SPS (7), PPS (8), SEI (6)
                         matches!(nal_type, 6 | 7 | 8)
                     }
-                    VideoCodec::Raw => false,
+                    VideoCodec::Raw | VideoCodec::RawLz4 => false,
                 };
 
                 if !is_param_set {
