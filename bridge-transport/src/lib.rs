@@ -10,6 +10,11 @@ pub mod udp;
 pub mod quic;
 pub mod discovery;
 
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+mod linux;
+
 pub use connection::*;
 pub use udp::*;
 pub use quic::*;

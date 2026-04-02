@@ -4,7 +4,7 @@
 
 use bridge_common::{BridgeResult, BridgeError, ServerInfo, Resolution};
 use std::ffi::{c_void, CStr, CString};
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::ptr;
@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::{SERVICE_TYPE, SERVICE_DOMAIN};
-use crate::discovery::{DiscoveryEvent, is_thunderbolt_interface};
+use crate::discovery::DiscoveryEvent;
 
 // DNS-SD FFI types
 type DNSServiceRef = *mut c_void;
