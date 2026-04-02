@@ -9,6 +9,7 @@ pub mod connection;
 pub mod udp;
 pub mod quic;
 pub mod discovery;
+pub mod tcp_video;
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -27,6 +28,7 @@ pub const DEFAULT_CONTROL_PORT: u16 = 9420;
 pub const DEFAULT_VIDEO_PORT: u16 = 9421;
 pub const DEFAULT_AUDIO_PORT: u16 = 9422;
 pub const DEFAULT_INPUT_PORT: u16 = 9423;
+pub const DEFAULT_TCP_VIDEO_PORT: u16 = 9424;
 
 /// Service name for Bonjour discovery
 pub const SERVICE_TYPE: &str = "_bridge._tcp";
@@ -43,6 +45,8 @@ pub struct TransportConfig {
     pub audio_port: u16,
     /// Input events port (UDP)
     pub input_port: u16,
+    /// TCP video port (for Thunderbolt+LZ4 mode)
+    pub tcp_video_port: u16,
     /// Maximum packet size for UDP
     pub max_packet_size: usize,
     /// Send buffer size
@@ -58,6 +62,7 @@ impl Default for TransportConfig {
             video_port: DEFAULT_VIDEO_PORT,
             audio_port: DEFAULT_AUDIO_PORT,
             input_port: DEFAULT_INPUT_PORT,
+            tcp_video_port: DEFAULT_TCP_VIDEO_PORT,
             max_packet_size: bridge_common::MAX_UDP_PACKET_SIZE,
             send_buffer_size: 16 * 1024 * 1024, // 16MB
             recv_buffer_size: 16 * 1024 * 1024, // 16MB

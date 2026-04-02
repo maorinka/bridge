@@ -34,3 +34,9 @@ objc2 = { workspace = true }
 objc2-foundation = { workspace = true }
 block2 = { workspace = true }
 core-foundation = { workspace = true }
+
+# Compression
+lz4_flex = "0.11"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }

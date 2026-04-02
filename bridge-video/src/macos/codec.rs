@@ -48,12 +48,12 @@ impl VideoEncoder {
             match config.codec {
                 VideoCodec::H264 => "H.264",
                 VideoCodec::H265 => "H.265",
-                VideoCodec::Raw => "Raw",
+                VideoCodec::Raw | VideoCodec::RawLz4 => "Raw",
             },
             config.bitrate
         );
 
-        if config.codec == VideoCodec::Raw {
+        if config.codec == VideoCodec::Raw || config.codec == VideoCodec::RawLz4 {
             return Err(BridgeError::Video("Raw codec doesn't need encoder".into()));
         }
 
@@ -63,7 +63,7 @@ impl VideoEncoder {
         let codec_type = match config.codec {
             VideoCodec::H264 => K_CM_VIDEO_CODEC_TYPE_H264,
             VideoCodec::H265 => K_CM_VIDEO_CODEC_TYPE_HEVC,
-            VideoCodec::Raw => unreachable!(),
+            VideoCodec::Raw | VideoCodec::RawLz4 => unreachable!(),
         };
 
         let drop_count = Arc::new(AtomicU64::new(0));
@@ -202,7 +202,7 @@ impl VideoEncoder {
                 (VideoCodec::H265, true) => kVTProfileLevel_HEVC_Main10_AutoLevel,
                 (VideoCodec::H265, false) => kVTProfileLevel_HEVC_Main_AutoLevel,
                 (VideoCodec::H264, _) => kVTProfileLevel_H264_Main_AutoLevel,
-                (VideoCodec::Raw, _) => ptr::null(),
+                (VideoCodec::Raw | VideoCodec::RawLz4, _) => ptr::null(),
             };
             if !profile.is_null() {
                 let status = VTSessionSetProperty(
@@ -577,13 +577,13 @@ extern "C" fn encoder_output_callback(
                     let nal_type = match ctx.codec {
                         VideoCodec::H265 => (data[offset + 4] >> 1) & 0x3F,
                         VideoCodec::H264 => data[offset + 4] & 0x1F,
-                        VideoCodec::Raw => 0,
+                        VideoCodec::Raw | VideoCodec::RawLz4 => 0,
                     };
 
                     let is_idr = match ctx.codec {
                         VideoCodec::H265 => nal_type >= 19 && nal_type <= 21, // IDR_W_RADL, IDR_N_LP, CRA
                         VideoCodec::H264 => nal_type == 5, // IDR
-                        VideoCodec::Raw => false,
+                        VideoCodec::Raw | VideoCodec::RawLz4 => false,
                     };
 
                     if is_idr {
@@ -688,7 +688,7 @@ unsafe fn extract_and_prepend_parameter_sets(
                 }
             }
         }
-        VideoCodec::Raw => {}
+        VideoCodec::Raw | VideoCodec::RawLz4 => {}
     }
 
     // Append original frame data
@@ -731,11 +731,11 @@ impl VideoDecoder {
             match codec {
                 VideoCodec::H264 => "H.264",
                 VideoCodec::H265 => "H.265",
-                VideoCodec::Raw => "Raw",
+                VideoCodec::Raw | VideoCodec::RawLz4 => "Raw",
             }
         );
 
-        if codec == VideoCodec::Raw {
+        if codec == VideoCodec::Raw || codec == VideoCodec::RawLz4 {
             return Err(BridgeError::Video("Raw codec doesn't need decoder".into()));
         }
 
@@ -821,7 +821,7 @@ impl VideoDecoder {
                     }
                     desc
                 }
-                VideoCodec::Raw => unreachable!(),
+                VideoCodec::Raw | VideoCodec::RawLz4 => unreachable!(),
             };
 
             self.format_desc = format_desc;
@@ -1056,7 +1056,7 @@ impl VideoDecoder {
         match codec {
             VideoCodec::H264 => Self::extract_h264_params(&nal_units),
             VideoCodec::H265 => Self::extract_h265_params(&nal_units),
-            VideoCodec::Raw => None,
+            VideoCodec::Raw | VideoCodec::RawLz4 => None,
         }
     }
 
@@ -1093,7 +1093,7 @@ impl VideoDecoder {
                         // SPS (7), PPS (8), SEI (6)
                         matches!(nal_type, 6 | 7 | 8)
                     }
-                    VideoCodec::Raw => false,
+                    VideoCodec::Raw | VideoCodec::RawLz4 => false,
                 };
 
                 if !is_param_set {

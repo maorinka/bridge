@@ -12,7 +12,7 @@ use bridge_common::{
 use bridge_transport::{
     BridgeConnection, QuicServer, ServiceAdvertiser, TransportConfig,
     DEFAULT_CONTROL_PORT, get_thunderbolt_address, is_thunderbolt_connection,
-    discovery::get_local_addresses,
+    discovery::get_local_addresses, tcp_video,
 };
 use bridge_video::{CaptureConfig, EncoderConfig, ScreenCapturer, VideoEncoder, get_displays, virtual_display::{VirtualDisplay, is_virtual_display_supported}};
 use bridge_input::InputInjector;
@@ -216,13 +216,10 @@ async fn handle_client(
         info!("No physical display detected (headless mode)");
     }
 
-    // For Thunderbolt: use larger packets and socket buffers
-    let mut config = config;
-    if is_thunderbolt {
-        config.send_buffer_size = 64 * 1024 * 1024; // 64MB
-        config.recv_buffer_size = 64 * 1024 * 1024;
-        info!("Thunderbolt: using MTU-safe packet size with 64MB socket buffers");
-    }
+    // For Thunderbolt+LZ4: video goes over TCP (kernel handles segmentation).
+    // UDP channels still used for audio/input at default MTU.
+    let config = config;
+    let tcp_video_port = if is_thunderbolt { Some(config.tcp_video_port) } else { None };
     let max_packet_size = config.max_packet_size;
 
     // Accept with config negotiation
@@ -231,6 +228,7 @@ async fn handle_client(
         control_conn,
         config,
         server_name,
+        tcp_video_port,
         |hello| {
             let mut cfg = hello.video_config.clone();
 
@@ -249,15 +247,12 @@ async fn handle_client(
                 cfg.bitrate = server_video_config.bitrate;
             }
 
-            // For Thunderbolt connections, use H.265 at very high bitrate
-            // Raw 4K60 BGRA = ~16 Gbps, exceeds Thunderbolt IP's ~10 Gbps limit
-            // H.265 at 200 Mbps looks near-perfect and fits easily
+            // For Thunderbolt connections, use LZ4-compressed raw BGRA for pixel-perfect quality.
+            // H.265 uses YUV 4:2:0 which halves chroma resolution — visibly degrades text/icons.
+            // LZ4 compresses desktop content ~5:1, so 4K60 ≈ 3 Gbps (fits in Thunderbolt's 10 Gbps).
             if is_thunderbolt {
-                cfg.codec = bridge_common::VideoCodec::H265;
-                if cfg.bitrate < 120_000_000 {
-                    cfg.bitrate = 200_000_000; // 200 Mbps minimum for Thunderbolt
-                }
-                info!("Thunderbolt: using H.265 at {} Mbps", cfg.bitrate / 1_000_000);
+                cfg.codec = bridge_common::VideoCodec::RawLz4;
+                info!("Thunderbolt: using LZ4-compressed raw BGRA (pixel-perfect)");
             }
 
             // If virtual displays are unavailable and requested resolution differs from native,
@@ -285,6 +280,23 @@ async fn handle_client(
     ).await?;
 
     info!("Handshake complete with client: {}", hello.client_name);
+
+    // Start TCP video server for Thunderbolt+LZ4
+    let tcp_video_tx = if let Some(port) = tcp_video_port {
+        match tcp_video::start_tcp_video_server(port, remote_addr.ip()) {
+            Ok(tx) => {
+                info!("TCP video server started on port {}", port);
+                Some(tx)
+            }
+            Err(e) => {
+                error!("Failed to start TCP video server: {}", e);
+                return Err(anyhow::anyhow!("TCP video server failed: {}", e));
+            }
+        }
+    } else {
+        None
+    };
+    let use_tcp_video = tcp_video_tx.is_some();
 
     // Get the negotiated video config
     let video_config = conn.video_config().cloned().unwrap();
@@ -371,9 +383,6 @@ async fn handle_client(
     // On Linux, X11 GetImage captures at native resolution — no scaling.
     #[cfg(target_os = "linux")]
     let (capture_width, capture_height) = if has_physical_display {
-        // X11 GetImage captures at native resolution. If native is >1080p,
-        // use 0x0 (native) for capture but the encoder will handle the full res.
-        // On Jetson Nano, the HW encoder maxes out at 1080p30 comfortably.
         let cw = if native_width > 1920 { native_width } else { native_width };
         let ch = if native_height > 1080 { native_height } else { native_height };
         info!("Linux: capturing at {}x{}", cw, ch);
@@ -381,6 +390,9 @@ async fn handle_client(
     } else {
         (video_config.width, video_config.height)
     };
+    // On macOS, capture at the requested (negotiated) resolution.
+    // If the virtual display renders at a lower resolution (e.g. 1080p),
+    // macOS will upscale using high-quality algorithms (bicubic/Lanczos).
     #[cfg(not(target_os = "linux"))]
     let (capture_width, capture_height) = if use_native_resolution_fallback && has_physical_display {
         (native_width, native_height)
@@ -421,7 +433,9 @@ async fn handle_client(
     };
     let mut capturer = ScreenCapturer::new(capture_config)?;
 
-    let is_raw_mode = capture_video_config.codec == bridge_common::VideoCodec::Raw;
+    let is_raw_mode = capture_video_config.codec == bridge_common::VideoCodec::Raw
+        || capture_video_config.codec == bridge_common::VideoCodec::RawLz4;
+    let is_lz4_mode = capture_video_config.codec == bridge_common::VideoCodec::RawLz4;
     let mut encoder = if !is_raw_mode {
         let mut encoder_config = EncoderConfig::from(&capture_video_config);
         if is_thunderbolt {
@@ -429,6 +443,9 @@ async fn handle_client(
             info!("Thunderbolt: encoder set to max quality mode");
         }
         Some(VideoEncoder::new(encoder_config)?)
+    } else if is_lz4_mode {
+        info!("LZ4 raw mode: pixel-perfect quality, no H.265 encoder");
+        None
     } else {
         info!("Raw mode: skipping encoder (frames sent uncompressed)");
         None
@@ -465,7 +482,9 @@ async fn handle_client(
     let max_bitrate = if is_thunderbolt {
         300_000_000u32  // Avoid unstable ultra-high bitrates.
     } else {
-        80_000_000u32   // 80 Mbps for WiFi (802.11ac can handle this)
+        // Use CLI --bitrate as adaptive ceiling when explicitly set (> default 50 Mbps),
+        // otherwise cap at 80 Mbps for WiFi.
+        initial_bitrate.max(80_000_000u32)
     };
     let mut current_bitrate = if is_thunderbolt {
         initial_bitrate.max(120_000_000).min(max_bitrate)
@@ -482,7 +501,10 @@ async fn handle_client(
     info!("Server components initialized");
 
     // Wait for UDP ping packets from client to learn their address
-    // Wait for client UDP pings using tokio polling
+    // Skip video ping when using TCP video channel
+    if use_tcp_video {
+        info!("TCP video channel active — skipping UDP video ping wait");
+    } else {
     info!("Waiting for client UDP pings...");
 
     // Poll for video ping with timeout
@@ -512,6 +534,8 @@ async fn handle_client(
             }
         }
     }
+
+    } // end if !use_tcp_video
 
     // Audio ping skipped — audio disabled
 
@@ -603,8 +627,9 @@ async fn handle_client(
                                     report.decode_latency_us,
                                     report.packet_loss * 100.0, report.jitter_us);
 
-                                // Skip adaptive bitrate for raw mode (no encoder to adjust)
-                                if !is_raw_mode {
+                                // Skip adaptive bitrate for raw mode (no encoder) and
+                                // Thunderbolt/max_quality (constant quality, no rate control)
+                                if !is_raw_mode && !is_thunderbolt {
                                 if let Some(ref mut enc) = encoder {
                                     if last_bitrate_adjustment.elapsed() > bitrate_adjustment_interval {
                                         let new_bitrate = if report.packet_loss > 0.10 {
@@ -716,13 +741,59 @@ async fn handle_client(
                 let mut frames_this_tick = 0u32;
 
                 if is_raw_mode {
-                    // Raw mode: send captured frame data directly (no encoding)
+                    // Raw/LZ4 mode: send captured frame data (no H.265 encoding)
                     while let Some(frame) = capturer.recv_frame() {
                         frames_this_tick += 1;
-                        if let Some(video_ch) = conn.video_channel() {
-                            let data = frame.read_pixel_data();
-                            let fragment_count = data.len().div_ceil(fragment_size);
+                        let raw_data = frame.read_pixel_data();
+                        let data = if is_lz4_mode {
+                            let compressed = lz4_flex::compress_prepend_size(&raw_data);
+                            debug!("LZ4: {} -> {} bytes ({:.1}:1)",
+                                   raw_data.len(), compressed.len(),
+                                   raw_data.len() as f64 / compressed.len() as f64);
+                            compressed
+                        } else {
+                            raw_data
+                        };
 
+                        if let Some(ref tcp_tx) = tcp_video_tx {
+                            // TCP path: send complete frame (kernel handles segmentation)
+                            let frame_header = VideoFrameHeader {
+                                frame_number: video_frame_number,
+                                pts_us: frame.pts_us,
+                                is_keyframe: true,
+                                frame_size: data.len() as u32,
+                                fragment_index: 0,
+                                fragment_count: 1,
+                                width: capture_width,
+                                height: capture_height,
+                            };
+                            let header_bytes = match bincode::serialize(&frame_header) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    warn!("Failed to serialize frame header: {}", e);
+                                    continue;
+                                }
+                            };
+                            let mut tcp_data = Vec::with_capacity(header_bytes.len() + data.len());
+                            tcp_data.extend_from_slice(&header_bytes);
+                            tcp_data.extend_from_slice(&data);
+
+                            match tcp_tx.try_send(tcp_video::TcpVideoFrame { data: tcp_data }) {
+                                Ok(()) => {
+                                    stats_bytes_sent += data.len() as u64;
+                                    debug!("TCP: sent frame {} ({} bytes)", video_frame_number, data.len());
+                                }
+                                Err(crossbeam_channel::TrySendError::Full(_)) => {
+                                    debug!("TCP video: dropping frame {} (backpressure)", video_frame_number);
+                                }
+                                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                                    error!("TCP video: channel disconnected");
+                                    break;
+                                }
+                            }
+                        } else if let Some(video_ch) = conn.video_channel() {
+                            // UDP path: fragment and send
+                            let fragment_count = data.len().div_ceil(fragment_size);
                             debug!("Sending raw frame {} ({}x{}, {} bytes, {} fragments)",
                                    video_frame_number, frame.width, frame.height, data.len(), fragment_count);
 
@@ -763,9 +834,9 @@ async fn handle_client(
                                     tokio::task::yield_now().await;
                                 }
                             }
-                            video_frame_number += 1;
-                            stats_frames_sent += 1;
                         }
+                        video_frame_number += 1;
+                        stats_frames_sent += 1;
                     }
                 } else if let Some(ref mut enc) = encoder {
                     // Stage 1: Submit captured frames to encoder

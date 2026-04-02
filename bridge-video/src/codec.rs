@@ -2,7 +2,7 @@
 //!
 //! Platform-specific encoder/decoder implementations live in:
 //! - `macos/codec.rs` — VideoToolbox hardware encoding/decoding
-//! - `linux/` — (future) V4L2/NVENC encoding
+//! - `linux/v4l2_encoder.rs` — NVIDIA V4L2/GStreamer encoding
 
 use bridge_common::{VideoCodec, VideoConfig};
 use bytes::Bytes;
@@ -85,9 +85,9 @@ impl Default for EncoderConfig {
             width: 1920,
             height: 1080,
             fps: 60,
-            bitrate: 60_000_000, // 60 Mbps
+            bitrate: 60_000_000,
             codec: VideoCodec::H265,
-            keyframe_interval: 60, // 1 second at 60fps
+            keyframe_interval: 60,
             low_latency: true,
             realtime: true,
             max_quality: false,

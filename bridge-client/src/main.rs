@@ -23,7 +23,7 @@ use bridge_common::{
 };
 use bridge_transport::{
     BridgeConnection, ServiceBrowser, TransportConfig, DEFAULT_CONTROL_PORT,
-    is_thunderbolt_connection,
+    is_thunderbolt_connection, tcp_video,
 };
 use bridge_video::{MetalDisplay, VideoDecoder, DecodedFrame};
 // TODO: Input disabled - focus on video first
@@ -408,13 +408,8 @@ async fn async_main(args: &Args, mtm: MainThreadMarker) -> Result<()> {
         pixel_format: bridge_common::PixelFormat::Bgra8,
     };
 
-    // Connect to server — use larger packets and buffers for Thunderbolt
-    let mut transport_config = TransportConfig::default();
-    if is_thunderbolt {
-        transport_config.send_buffer_size = 64 * 1024 * 1024; // 64MB
-        transport_config.recv_buffer_size = 64 * 1024 * 1024;
-        info!("Thunderbolt: using MTU-safe packet size with 64MB socket buffers");
-    }
+    // Connect to server (TCP handles video for Thunderbolt, UDP uses default MTU)
+    let transport_config = TransportConfig::default();
     let mut conn = BridgeConnection::new(server_addr, transport_config);
 
     let welcome = conn.connect_with_config(
@@ -432,27 +427,43 @@ async fn async_main(args: &Args, mtm: MainThreadMarker) -> Result<()> {
     let video_config = welcome.video_config;
     let _audio_config = welcome.audio_config;
 
-    // Send ping packets on UDP channels so server learns our address
-    // Retry multiple times to handle race condition where server may not be ready yet
-    info!("Sending UDP channel pings...");
-    for attempt in 0..10 {
-        if attempt > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        if let Some(video_ch) = conn.video_channel() {
-            if let Err(e) = video_ch.send(bridge_common::PacketType::Video, b"ping").await {
-                error!("Failed to send video ping: {}", e);
+    // Connect TCP video channel if server announced one (Thunderbolt+LZ4)
+    let tcp_video_rx = if let Some(tcp_port) = welcome.tcp_video_port {
+        let tcp_addr = std::net::SocketAddr::new(server_addr.ip(), tcp_port);
+        info!("Connecting TCP video channel to {}", tcp_addr);
+        match tcp_video::start_tcp_video_client(tcp_addr) {
+            Ok(rx) => {
+                info!("TCP video channel connected");
+                Some(rx)
+            }
+            Err(e) => {
+                error!("Failed to connect TCP video channel: {}", e);
+                return Err(anyhow!("TCP video connection failed: {}", e));
             }
         }
-        // Audio ping skipped — audio disabled
-        // TODO: Input disabled - focus on video first
-        // if let Some(input_ch) = conn.input_channel() {
-        //     if let Err(e) = input_ch.send(bridge_common::PacketType::Input, b"ping").await {
-        //         error!("Failed to send input ping: {}", e);
-        //     }
-        // }
+    } else {
+        None
+    };
+    let use_tcp_video = tcp_video_rx.is_some();
+
+    // Send ping packets on UDP channels so server learns our address
+    // Skip video pings when using TCP video channel
+    if use_tcp_video {
+        info!("TCP video channel active — skipping UDP video pings");
+    } else {
+        info!("Sending UDP channel pings...");
+        for attempt in 0..10 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            if let Some(video_ch) = conn.video_channel() {
+                if let Err(e) = video_ch.send(bridge_common::PacketType::Video, b"ping").await {
+                    error!("Failed to send video ping: {}", e);
+                }
+            }
+        }
+        debug!("UDP pings sent (10 attempts over 900ms)");
     }
-    debug!("UDP pings sent (10 attempts over 900ms)");
 
     // Create window — use received config dimensions (server may have negotiated different resolution)
     let fullscreen = !args.windowed;
@@ -596,62 +607,85 @@ async fn async_main(args: &Args, mtm: MainThreadMarker) -> Result<()> {
                     }
                 }
             }
-            // Wake every 8ms to pump macOS events even when no data arrives
-            // (60fps = 16.7ms per frame, so 8ms gives responsive UI + catches frames quickly)
-            _ = tokio::time::sleep(std::time::Duration::from_millis(8)) => {}
+            // Wake every 1ms to pump macOS events and drain video packets promptly.
+            // Lower sleep = lower latency at the cost of more CPU (negligible on modern hardware).
+            _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
         }
 
-        // Receive video frames — drain all available packets, decode all, render only latest
-        if let Some(video_ch) = conn.video_channel() {
+        // Receive video frames — drain all available, decode all, render only latest
+        {
             let mut packets_this_round = 0u32;
             let mut complete_frames: Vec<(VideoFrameHeader, Vec<u8>)> = Vec::new();
 
-            // Phase 1: Drain all available packets and collect complete frames
-            loop {
-                // Short timeout: we already waited in the select! above,
-                // so just drain what's available without blocking long
-                let recv_result = tokio::time::timeout(
-                    std::time::Duration::from_millis(if packets_this_round == 0 { 2 } else { 0 }),
-                    video_ch.recv()
-                ).await;
-
-                match recv_result {
-                    Ok(Ok((header, data))) => {
-                        if header.packet_type != bridge_common::PacketType::Video {
+            if let Some(ref tcp_rx) = tcp_video_rx {
+                // TCP path: each recv is a complete frame (header + payload)
+                while let Ok(frame) = tcp_rx.try_recv() {
+                    packets_this_round += 1;
+                    let data = &frame.data;
+                    if data.len() < VideoFrameHeader::SIZE {
+                        warn!("TCP video: frame too short ({} bytes)", data.len());
+                        continue;
+                    }
+                    let video_header: VideoFrameHeader = match bincode::deserialize(&data[..VideoFrameHeader::SIZE]) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            warn!("TCP video: failed to parse header: {}", e);
                             continue;
                         }
-                        packets_this_round += 1;
+                    };
+                    let payload = data[VideoFrameHeader::SIZE..].to_vec();
+                    if video_header.frame_number > expected_frame {
+                        dropped_frames += video_header.frame_number - expected_frame;
+                    }
+                    expected_frame = video_header.frame_number + 1;
+                    received_frames += 1;
+                    complete_frames.push((video_header, payload));
+                }
+            } else if let Some(video_ch) = conn.video_channel() {
+                // UDP path: fragment reassembly
+                loop {
+                    let recv_result = tokio::time::timeout(
+                        std::time::Duration::from_millis(if packets_this_round == 0 { 2 } else { 0 }),
+                        video_ch.recv()
+                    ).await;
 
-                        // Parse the VideoFrameHeader from the data
-                        let video_header: VideoFrameHeader = match bincode::deserialize(&data[..VideoFrameHeader::SIZE.min(data.len())]) {
-                            Ok(h) => h,
-                            Err(e) => {
-                                warn!("Failed to parse video frame header: {}", e);
+                    match recv_result {
+                        Ok(Ok((header, data))) => {
+                            if header.packet_type != bridge_common::PacketType::Video {
                                 continue;
                             }
-                        };
+                            packets_this_round += 1;
 
-                        if video_header.fragment_index == 0 {
-                            debug!("Receiving frame {} ({} fragments, keyframe={})",
-                                   video_header.frame_number, video_header.fragment_count, video_header.is_keyframe);
-                        }
+                            let video_header: VideoFrameHeader = match bincode::deserialize(&data[..VideoFrameHeader::SIZE.min(data.len())]) {
+                                Ok(h) => h,
+                                Err(e) => {
+                                    warn!("Failed to parse video frame header: {}", e);
+                                    continue;
+                                }
+                            };
 
-                        let fragment_data = data[VideoFrameHeader::SIZE.min(data.len())..].to_vec();
-
-                        if let Some((complete_header, complete_data)) = frame_reassembler.add_fragment(video_header, fragment_data) {
-                            if complete_header.frame_number > expected_frame {
-                                dropped_frames += complete_header.frame_number - expected_frame;
+                            if video_header.fragment_index == 0 {
+                                debug!("Receiving frame {} ({} fragments, keyframe={})",
+                                       video_header.frame_number, video_header.fragment_count, video_header.is_keyframe);
                             }
-                            expected_frame = complete_header.frame_number + 1;
-                            received_frames += 1;
-                            complete_frames.push((complete_header, complete_data));
+
+                            let fragment_data = data[VideoFrameHeader::SIZE.min(data.len())..].to_vec();
+
+                            if let Some((complete_header, complete_data)) = frame_reassembler.add_fragment(video_header, fragment_data) {
+                                if complete_header.frame_number > expected_frame {
+                                    dropped_frames += complete_header.frame_number - expected_frame;
+                                }
+                                expected_frame = complete_header.frame_number + 1;
+                                received_frames += 1;
+                                complete_frames.push((complete_header, complete_data));
+                            }
                         }
+                        Ok(Err(e)) => {
+                            error!("Video channel error: {}", e);
+                            return Err(anyhow!("Video channel failed: {}", e));
+                        }
+                        Err(_) => break,
                     }
-                    Ok(Err(e)) => {
-                        error!("Video channel error: {}", e);
-                        return Err(anyhow!("Video channel failed: {}", e));
-                    }
-                    Err(_) => break,
                 }
             }
 
@@ -669,7 +703,10 @@ async fn async_main(args: &Args, mtm: MainThreadMarker) -> Result<()> {
                 }
 
                 // Create decoder lazily
-                if decoder.is_none() && video_codec != bridge_common::VideoCodec::Raw {
+                if decoder.is_none()
+                    && video_codec != bridge_common::VideoCodec::Raw
+                    && video_codec != bridge_common::VideoCodec::RawLz4
+                {
                     info!("Creating decoder for {}x{} frames",
                           complete_header.width, complete_header.height);
                     _actual_frame_width = Some(complete_header.width);
@@ -707,7 +744,28 @@ async fn async_main(args: &Args, mtm: MainThreadMarker) -> Result<()> {
                             None
                         }
                     }
+                } else if video_codec == bridge_common::VideoCodec::RawLz4 && is_last {
+                    // LZ4-compressed raw BGRA — decompress for pixel-perfect rendering
+                    match lz4_flex::decompress_size_prepended(&complete_data) {
+                        Ok(decompressed) => {
+                            debug!("LZ4 decompress: {} -> {} bytes", complete_data.len(), decompressed.len());
+                            Some(DecodedFrame {
+                                data: decompressed,
+                                width: complete_header.width,
+                                height: complete_header.height,
+                                bytes_per_row: complete_header.width * 4,
+                                pts_us: complete_header.pts_us,
+                                io_surface: None,
+                                cv_pixel_buffer: None,
+                            })
+                        }
+                        Err(e) => {
+                            warn!("LZ4 decompress failed: {}", e);
+                            None
+                        }
+                    }
                 } else if is_last {
+                    // Raw uncompressed BGRA
                     Some(DecodedFrame {
                         data: complete_data,
                         width: complete_header.width,

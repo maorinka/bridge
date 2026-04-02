@@ -70,7 +70,7 @@ pub fn recommended_bitrate(config: &VideoConfig) -> u32 {
     let base = match config.codec {
         VideoCodec::H265 => pixels * fps / 100, // ~10 bits per pixel for HEVC
         VideoCodec::H264 => pixels * fps / 50,  // ~20 bits per pixel for AVC
-        VideoCodec::Raw => pixels * fps * 32,   // 32 bits per pixel
+        VideoCodec::Raw | VideoCodec::RawLz4 => pixels * fps * 32,   // 32 bits per pixel
     };
 
     // Cap at reasonable values
