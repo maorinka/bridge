@@ -89,7 +89,7 @@ impl VideoEncoder {
 
         info!("NVIDIA V4L2 encoder created successfully");
 
-        let (encoded_tx, encoded_rx) = bounded(8);
+        let (encoded_tx, encoded_rx) = bounded(64);
 
         Ok(Self {
             config,
