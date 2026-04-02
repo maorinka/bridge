@@ -1,6 +1,6 @@
-//! Bridge Server - Mac Mini daemon
+//! Bridge Server daemon
 //!
-//! The server runs on the Mac Mini and:
+//! The server runs on the host machine (macOS or Linux) and:
 //! - Captures the screen and streams video to the client
 //! - Receives input events from the client and injects them
 //! - Captures system audio and streams to the client
@@ -24,7 +24,7 @@ use tracing_subscriber::FmtSubscriber;
 
 #[derive(Parser, Debug)]
 #[command(name = "bridge-server")]
-#[command(about = "Bridge server daemon for Mac Mini", long_about = None)]
+#[command(about = "Bridge server daemon", long_about = None)]
 struct Args {
     /// Port for the control channel
     #[arg(short, long, default_value_t = DEFAULT_CONTROL_PORT)]
@@ -349,7 +349,12 @@ async fn handle_client(
                 None
             }
         } else {
+            #[cfg(target_os = "macos")]
             error!("Headless mode requires macOS 14+ for virtual display support");
+            #[cfg(target_os = "linux")]
+            error!("Headless mode requires Xvfb: sudo apt install xvfb");
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            error!("Headless mode requires virtual display support");
             return Err(anyhow::anyhow!("No display available: virtual display not supported"));
         }
     } else {
@@ -646,7 +651,7 @@ async fn handle_client(
                         }
                     }
 
-                    // Small delay for macOS to register display changes
+                    // Small delay for the OS to register display changes
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
                     match capturer.restart(new_display_id).await {
@@ -739,8 +744,12 @@ async fn handle_client(
                     // Stage 1: Submit ALL captured frames to encoder (fast — just queues to VT)
                     while let Some(mut frame) = capturer.recv_frame() {
                         frames_this_tick += 1;
+                        #[cfg(target_os = "macos")]
                         debug!("Encoding frame {} ({}x{}, IOSurface={})",
                                frame.frame_number, frame.width, frame.height, frame.io_surface.is_some());
+                        #[cfg(not(target_os = "macos"))]
+                        debug!("Encoding frame {} ({}x{})",
+                               frame.frame_number, frame.width, frame.height);
                         if let Err(e) = enc.encode(&mut frame) {
                             warn!("Encode error: {}", e);
                         }

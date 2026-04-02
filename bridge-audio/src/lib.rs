@@ -1,8 +1,8 @@
 //! Bridge Audio Subsystem
 //!
-//! Provides low-latency audio capture and playback:
-//! - Audio capture via CoreAudio (or DriverKit virtual device)
-//! - Audio playback via CoreAudio with low-latency buffer configuration
+//! Provides low-latency audio capture and playback using cpal (cross-platform):
+//! - macOS: CoreAudio backend (or DriverKit virtual device for system audio)
+//! - Linux: ALSA backend via cpal
 
 pub mod capture;
 pub mod playback;
