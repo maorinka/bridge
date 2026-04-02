@@ -6,7 +6,7 @@
 use bridge_common::VideoCodec;
 use bridge_video::{
     CaptureConfig, ScreenCapturer, VideoEncoder, EncoderConfig,
-    capture::{get_displays, is_capture_supported},
+    get_displays, is_capture_supported,
     virtual_display::{VirtualDisplay, is_virtual_display_supported},
 };
 
@@ -127,10 +127,16 @@ async fn main() {
     header("Virtual Display");
 
     if !is_virtual_display_supported() {
+        #[cfg(target_os = "macos")]
         warn("CGVirtualDisplay API not available (requires macOS 14+)");
+        #[cfg(target_os = "linux")]
+        warn("Xvfb not found. Install: sudo apt install xvfb");
         results.virtual_display = None;
     } else {
+        #[cfg(target_os = "macos")]
         info("CGVirtualDisplay API is available");
+        #[cfg(target_os = "linux")]
+        info("Xvfb is available");
         info("Attempting to create 3840x2160 @ 60Hz virtual display...");
 
         match VirtualDisplay::new(3840, 2160, 60) {
@@ -155,38 +161,45 @@ async fn main() {
                     warn("Virtual display NOT found in display list (may not be fully registered)");
                 }
 
-                // Check logical vs backing pixel resolution
-                let (logical_w, logical_h, pixel_w, pixel_h) = unsafe {
-                    extern "C" {
-                        fn CGDisplayPixelsWide(display: u32) -> usize;
-                        fn CGDisplayPixelsHigh(display: u32) -> usize;
-                        fn CGDisplayCopyDisplayMode(display: u32) -> *const std::ffi::c_void;
-                        fn CGDisplayModeGetPixelWidth(mode: *const std::ffi::c_void) -> usize;
-                        fn CGDisplayModeGetPixelHeight(mode: *const std::ffi::c_void) -> usize;
-                        fn CGDisplayModeRelease(mode: *const std::ffi::c_void);
-                    }
-                    let lw = CGDisplayPixelsWide(vd.display_id());
-                    let lh = CGDisplayPixelsHigh(vd.display_id());
-                    let mode = CGDisplayCopyDisplayMode(vd.display_id());
-                    let (pw, ph) = if !mode.is_null() {
-                        let w = CGDisplayModeGetPixelWidth(mode);
-                        let h = CGDisplayModeGetPixelHeight(mode);
-                        CGDisplayModeRelease(mode);
-                        (w, h)
-                    } else {
-                        (lw, lh)
+                // Check resolution details (platform-specific)
+                #[cfg(target_os = "macos")]
+                {
+                    let (logical_w, logical_h, pixel_w, pixel_h) = unsafe {
+                        extern "C" {
+                            fn CGDisplayPixelsWide(display: u32) -> usize;
+                            fn CGDisplayPixelsHigh(display: u32) -> usize;
+                            fn CGDisplayCopyDisplayMode(display: u32) -> *const std::ffi::c_void;
+                            fn CGDisplayModeGetPixelWidth(mode: *const std::ffi::c_void) -> usize;
+                            fn CGDisplayModeGetPixelHeight(mode: *const std::ffi::c_void) -> usize;
+                            fn CGDisplayModeRelease(mode: *const std::ffi::c_void);
+                        }
+                        let lw = CGDisplayPixelsWide(vd.display_id());
+                        let lh = CGDisplayPixelsHigh(vd.display_id());
+                        let mode = CGDisplayCopyDisplayMode(vd.display_id());
+                        let (pw, ph) = if !mode.is_null() {
+                            let w = CGDisplayModeGetPixelWidth(mode);
+                            let h = CGDisplayModeGetPixelHeight(mode);
+                            CGDisplayModeRelease(mode);
+                            (w, h)
+                        } else {
+                            (lw, lh)
+                        };
+                        (lw, lh, pw, ph)
                     };
-                    (lw, lh, pw, ph)
-                };
-                info(&format!("Logical resolution:  {}x{} (CGDisplayPixelsWide/High)", logical_w, logical_h));
-                info(&format!("Backing pixels:      {}x{} (CGDisplayModeGetPixelWidth/Height)", pixel_w, pixel_h));
-                if pixel_w > logical_w {
-                    pass(&format!("HiDPI active: {}x scale", pixel_w / logical_w));
-                } else if pixel_w == logical_w && logical_w as u32 == vd.width() {
-                    pass("Native resolution matches requested (1x scale)");
-                } else {
-                    warn(&format!("Resolution mismatch: requested {}x{} but got {}x{} backing pixels",
-                        vd.width(), vd.height(), pixel_w, pixel_h));
+                    info(&format!("Logical resolution:  {}x{}", logical_w, logical_h));
+                    info(&format!("Backing pixels:      {}x{}", pixel_w, pixel_h));
+                    if pixel_w > logical_w {
+                        pass(&format!("HiDPI active: {}x scale", pixel_w / logical_w));
+                    } else if pixel_w == logical_w && logical_w as u32 == vd.width() {
+                        pass("Native resolution matches requested (1x scale)");
+                    } else {
+                        warn(&format!("Resolution mismatch: requested {}x{} but got {}x{} backing pixels",
+                            vd.width(), vd.height(), pixel_w, pixel_h));
+                    }
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    info(&format!("Virtual display: {}x{} (Xvfb)", vd.width(), vd.height()));
                 }
 
                 // Keep virtual display alive for capture test
@@ -265,10 +278,14 @@ async fn main() {
 
                                 // Show a sample frame's info
                                 if let Some(frame) = capturer.recv_frame() {
+                                    #[cfg(target_os = "macos")]
+                                    let surface_info = format!("io_surface={}", frame.io_surface.is_some());
+                                    #[cfg(target_os = "linux")]
+                                    let surface_info = format!("dma_buf={}", frame.dma_buf_fd.is_some());
                                     info(&format!(
-                                        "Sample frame: {}x{}, bytes_per_row={}, io_surface={}",
+                                        "Sample frame: {}x{}, bytes_per_row={}, {}",
                                         frame.width, frame.height, frame.bytes_per_row,
-                                        frame.io_surface.is_some()
+                                        surface_info
                                     ));
                                 }
                             } else {
@@ -331,7 +348,10 @@ async fn main() {
 
             match VideoEncoder::new(encoder_config) {
                 Ok(mut encoder) => {
+                    #[cfg(target_os = "macos")]
                     pass("VideoToolbox encoder created");
+                    #[cfg(target_os = "linux")]
+                    pass("V4L2 encoder created");
 
                     // Capture a few frames and encode them
                     let cap_config = CaptureConfig {
@@ -368,6 +388,7 @@ async fn main() {
                                 }
 
                                 // Flush and collect encoded frames
+                                #[cfg(target_os = "macos")]
                                 let _ = encoder.flush();
                                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 

@@ -1,9 +1,21 @@
-//! Bridge Client - iMac application
+//! Bridge Client
 //!
-//! The client runs on the iMac and:
-//! - Receives video from the server and displays it full-screen
-//! - Captures keyboard/mouse input and sends to the server
-//! - Receives audio from the server and plays it
+//! The client receives video from the server and displays it full-screen,
+//! captures keyboard/mouse input and sends to the server,
+//! and receives audio from the server and plays it.
+//!
+//! Currently macOS-only (Metal + Cocoa). Cross-platform client (wgpu) planned.
+
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    eprintln!("bridge-client currently requires macOS (Metal + Cocoa window system).");
+    eprintln!("Cross-platform client with wgpu is planned for a future release.");
+    eprintln!("On Linux, use bridge-server to stream, and connect from a Mac client.");
+    std::process::exit(1);
+}
+
+#[cfg(target_os = "macos")]
+mod macos_client {
 
 use anyhow::Result;
 use bridge_common::{
@@ -264,7 +276,7 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 10;
 /// Delay between reconnection attempts
 const RECONNECT_DELAY_MS: u64 = 2000;
 
-fn main() -> Result<()> {
+pub fn main() -> Result<()> {
     let args = Args::parse();
 
     // Initialize logging
@@ -865,4 +877,11 @@ async fn discover_server() -> Result<SocketAddr> {
 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
+}
+
+} // mod macos_client
+
+#[cfg(target_os = "macos")]
+fn main() -> anyhow::Result<()> {
+    macos_client::main()
 }

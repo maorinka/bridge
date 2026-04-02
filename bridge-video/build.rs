@@ -23,7 +23,7 @@ fn main() {
     #[cfg(target_os = "linux")]
     {
         // Link X11/XCB libraries for screen capture
-        println!("cargo:rustc-link-lib=x11");
+        println!("cargo:rustc-link-lib=X11");
         println!("cargo:rustc-link-lib=xcb");
         println!("cargo:rustc-link-lib=xcb-shm");
     }
