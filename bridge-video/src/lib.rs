@@ -30,6 +30,15 @@ pub mod virtual_display {
     pub use crate::macos::virtual_display::*;
 }
 
+#[cfg(target_os = "linux")]
+pub use linux::x11_capture::{ScreenCapturer, get_displays, is_capture_supported};
+#[cfg(target_os = "linux")]
+pub use linux::v4l2_encoder::VideoEncoder;
+#[cfg(target_os = "linux")]
+pub mod virtual_display {
+    pub use crate::linux::xvfb::*;
+}
+
 use bridge_common::{VideoConfig, VideoCodec, PixelFormat};
 
 /// Check if hardware encoding is available
