@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use tracing::{debug, error, info};
 
-use crate::sys::*;
+use super::sys::*;
 
 /// Input capture configuration
 #[derive(Debug, Clone)]

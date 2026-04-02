@@ -1,8 +1,11 @@
-//! Audio capture using CoreAudio
+//! Audio capture using cpal (cross-platform)
 //!
-//! For system audio capture (capturing what the Mac is playing),
+//! Uses cpal for input device capture on all platforms:
+//! - macOS: CoreAudio backend
+//! - Linux: ALSA backend
+//!
+//! For macOS system audio capture (capturing what the Mac is playing),
 //! a DriverKit AudioServerPlugin virtual device would be ideal.
-//! This module provides the Rust side of the capture interface.
 
 use bridge_common::{BridgeResult, BridgeError, AudioConfig, now_us};
 use bytes::Bytes;

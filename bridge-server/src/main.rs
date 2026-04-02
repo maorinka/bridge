@@ -1,6 +1,6 @@
-//! Bridge Server - Mac Mini daemon
+//! Bridge Server daemon
 //!
-//! The server runs on the Mac Mini and:
+//! The server runs on the host machine (macOS or Linux) and:
 //! - Captures the screen and streams video to the client
 //! - Receives input events from the client and injects them
 //! - Captures system audio and streams to the client
@@ -15,8 +15,7 @@ use bridge_transport::{
     discovery::get_local_addresses, tcp_video,
 };
 use bridge_video::{CaptureConfig, EncoderConfig, ScreenCapturer, VideoEncoder, get_displays, virtual_display::{VirtualDisplay, is_virtual_display_supported}};
-// TODO: Input disabled - focus on video first
-// use bridge_input::InputInjector;
+use bridge_input::InputInjector;
 use bridge_audio::AudioCapturer;
 use clap::Parser;
 use tracing::{debug, error, info, warn, Level};
@@ -24,7 +23,7 @@ use tracing_subscriber::FmtSubscriber;
 
 #[derive(Parser, Debug)]
 #[command(name = "bridge-server")]
-#[command(about = "Bridge server daemon for Mac Mini", long_about = None)]
+#[command(about = "Bridge server daemon", long_about = None)]
 struct Args {
     /// Port for the control channel
     #[arg(short, long, default_value_t = DEFAULT_CONTROL_PORT)]
@@ -305,9 +304,15 @@ async fn handle_client(
     // Determine capture resolution and display ID
     // For Thunderbolt: always create virtual display at client's requested resolution
     // For other connections: use native display if resolution matches, otherwise try virtual
+    // On Linux, Xvfb creates a SEPARATE blank X server (unlike macOS CGVirtualDisplay which
+    // adds a virtual monitor to the existing display server). So on Linux with a physical
+    // display, always capture from it — don't create a blank Xvfb.
     let mut _virtual_display: Option<VirtualDisplay> = None;
+    #[cfg(target_os = "linux")]
+    let need_virtual_display = !has_physical_display; // Only use Xvfb if truly headless
+    #[cfg(not(target_os = "linux"))]
     let need_virtual_display = !has_physical_display
-        || is_thunderbolt  // Always use virtual display for Thunderbolt to guarantee resolution match
+        || is_thunderbolt
         || video_config.width != native_width
         || video_config.height != native_height;
 
@@ -361,17 +366,34 @@ async fn handle_client(
                 None
             }
         } else {
+            #[cfg(target_os = "macos")]
             error!("Headless mode requires macOS 14+ for virtual display support");
+            #[cfg(target_os = "linux")]
+            error!("Headless mode requires Xvfb: sudo apt install xvfb");
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            error!("Headless mode requires virtual display support");
             return Err(anyhow::anyhow!("No display available: virtual display not supported"));
         }
     } else {
         None
     };
 
-    // Always capture at the requested (negotiated) resolution.
+    // Determine capture resolution
+    // On macOS, CGDisplayStream handles scaling to any resolution.
+    // On Linux, X11 GetImage captures at native resolution — no scaling.
+    #[cfg(target_os = "linux")]
+    let (capture_width, capture_height) = if has_physical_display {
+        let cw = if native_width > 1920 { native_width } else { native_width };
+        let ch = if native_height > 1080 { native_height } else { native_height };
+        info!("Linux: capturing at {}x{}", cw, ch);
+        (cw, ch)
+    } else {
+        (video_config.width, video_config.height)
+    };
+    // On macOS, capture at the requested (negotiated) resolution.
     // If the virtual display renders at a lower resolution (e.g. 1080p),
-    // macOS will upscale using high-quality algorithms (bicubic/Lanczos)
-    // which looks much better than doing bilinear upscaling on the client.
+    // macOS will upscale using high-quality algorithms (bicubic/Lanczos).
+    #[cfg(not(target_os = "linux"))]
     let (capture_width, capture_height) = if use_native_resolution_fallback && has_physical_display {
         (native_width, native_height)
     } else {
@@ -432,8 +454,16 @@ async fn handle_client(
     // Audio disabled — focusing on video first
     let mut audio_capturer: Option<AudioCapturer> = None;
 
-    // TODO: Input disabled - focus on video first
-    // let mut input_injector = InputInjector::new()?;
+    let mut input_injector = match InputInjector::new() {
+        Ok(inj) => {
+            info!("Input injector initialized");
+            Some(inj)
+        }
+        Err(e) => {
+            warn!("Input injection unavailable: {}. Continuing without input.", e);
+            None
+        }
+    };
 
     let mut is_streaming = false;
     let mut video_frame_number: u64 = 0;
@@ -509,31 +539,30 @@ async fn handle_client(
 
     // Audio ping skipped — audio disabled
 
-    // TODO: Input disabled - focus on video first
-    // if let Some(input_ch) = conn.input_channel() {
-    //     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    //     loop {
-    //         match tokio::time::timeout(
-    //             std::time::Duration::from_millis(50),
-    //             input_ch.recv()
-    //         ).await {
-    //             Ok(Ok((header, _))) => {
-    //                 debug!("Received input ping from client (type: {:?})", header.packet_type);
-    //                 break;
-    //             }
-    //             Ok(Err(e)) => {
-    //                 warn!("Error receiving input ping: {}", e);
-    //                 break;
-    //             }
-    //             Err(_) => {
-    //                 if tokio::time::Instant::now() > deadline {
-    //                     warn!("Timeout waiting for input ping");
-    //                     break;
-    //                 }
-    //             }
-    //         }
-    //     }
-    // }
+    if let Some(input_ch) = conn.input_channel() {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                input_ch.recv()
+            ).await {
+                Ok(Ok((header, _))) => {
+                    debug!("Received input ping from client (type: {:?})", header.packet_type);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    warn!("Error receiving input ping: {}", e);
+                    break;
+                }
+                Err(_) => {
+                    if tokio::time::Instant::now() > deadline {
+                        warn!("Timeout waiting for input ping");
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
     info!("UDP channels initialized");
 
@@ -674,7 +703,7 @@ async fn handle_client(
                         }
                     }
 
-                    // Small delay for macOS to register display changes
+                    // Small delay for the OS to register display changes
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
                     match capturer.restart(new_display_id).await {
@@ -810,17 +839,29 @@ async fn handle_client(
                         stats_frames_sent += 1;
                     }
                 } else if let Some(ref mut enc) = encoder {
-                    // Stage 1: Submit ALL captured frames to encoder (fast — just queues to VT)
+                    // Stage 1: Submit captured frames to encoder
+                    // On macOS, encode() is fast (queues to VT hardware) so drain all.
+                    // On Linux, encode() blocks on pipe write, so limit to 1 per tick.
+                    #[cfg(target_os = "macos")]
+                    let max_encode_per_tick = 16;
+                    #[cfg(not(target_os = "macos"))]
+                    let max_encode_per_tick = 1;
+
+                    let mut encoded_this_tick = 0u32;
                     while let Some(mut frame) = capturer.recv_frame() {
+                        if encoded_this_tick >= max_encode_per_tick {
+                            break;
+                        }
                         frames_this_tick += 1;
-                        debug!("Encoding frame {} ({}x{}, IOSurface={})",
-                               frame.frame_number, frame.width, frame.height, frame.io_surface.is_some());
+                        encoded_this_tick += 1;
+                        debug!("Encoding frame {} ({}x{})",
+                               frame.frame_number, frame.width, frame.height);
                         if let Err(e) = enc.encode(&mut frame) {
                             warn!("Encode error: {}", e);
                         }
                     }
 
-                    // Stage 2: Send ALL encoded output (VT may have finished previous frames)
+                    // Stage 2: Send ALL encoded output
                     while let Some(encoded) = enc.recv_frame() {
                         debug!("Encoded frame: {} bytes, keyframe={}", encoded.data.len(), encoded.is_keyframe);
                         if let Some(video_ch) = conn.video_channel() {
@@ -906,21 +947,23 @@ async fn handle_client(
             }
         }
 
-        // TODO: Input disabled - focus on video first
-        // if let Some(input_ch) = conn.input_channel() {
-        //     while let Ok(Ok((header, data))) = tokio::time::timeout(
-        //         std::time::Duration::from_micros(100),
-        //         input_ch.recv()
-        //     ).await {
-        //         if header.packet_type == bridge_common::PacketType::Input {
-        //             if let Ok(event) = InputEvent::from_bytes(&data) {
-        //                 if let Err(e) = input_injector.inject(&event) {
-        //                     debug!("Input injection error: {}", e);
-        //                 }
-        //             }
-        //         }
-        //     }
-        // }
+        // Process input events from client
+        if let Some(ref mut injector) = input_injector {
+            if let Some(input_ch) = conn.input_channel() {
+                while let Ok(Ok((header, data))) = tokio::time::timeout(
+                    std::time::Duration::from_micros(100),
+                    input_ch.recv()
+                ).await {
+                    if header.packet_type == bridge_common::PacketType::Input {
+                        if let Ok(event) = bridge_common::InputEvent::from_bytes(&data) {
+                            if let Err(e) = injector.inject(&event) {
+                                debug!("Input injection error: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Clean up

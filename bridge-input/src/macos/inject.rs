@@ -10,7 +10,7 @@ use bridge_common::{
 };
 use tracing::{debug, trace, warn};
 
-use crate::sys::*;
+use super::sys::*;
 
 /// Input injector for posting events to the system
 pub struct InputInjector {

@@ -38,6 +38,9 @@ pub enum BridgeError {
     #[error("macOS error: {0}")]
     MacOS(String),
 
+    #[error("Linux error: {0}")]
+    Linux(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

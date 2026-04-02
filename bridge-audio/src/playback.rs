@@ -1,6 +1,8 @@
-//! Audio playback using CoreAudio via cpal
+//! Audio playback using cpal (cross-platform)
 //!
 //! Provides low-latency audio playback with configurable buffer sizes.
+//! - macOS: CoreAudio backend
+//! - Linux: ALSA backend
 
 use bridge_common::{BridgeResult, BridgeError, AudioConfig};
 use std::collections::VecDeque;

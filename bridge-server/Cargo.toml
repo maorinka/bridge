@@ -25,6 +25,10 @@ tracing-subscriber = { workspace = true }
 parking_lot = { workspace = true }
 crossbeam-channel = { workspace = true }
 
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
 # macOS frameworks
 objc2 = { workspace = true }
 objc2-foundation = { workspace = true }

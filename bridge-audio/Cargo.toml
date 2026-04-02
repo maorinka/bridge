@@ -13,19 +13,16 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
 crossbeam-channel = { workspace = true }
-
-# Audio
 cpal = { workspace = true }
+libc = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
 # macOS frameworks
 objc2 = { workspace = true }
 objc2-foundation = { workspace = true }
 block2 = { workspace = true }
 core-foundation = { workspace = true }
 dispatch = { workspace = true }
-
-# For CoreAudio bindings
-libc = "0.2"
 
 [build-dependencies]
 cc = "1.2"
