@@ -187,23 +187,50 @@ impl Drop for VideoEncoder {
     }
 }
 
-/// Check if an H.264/H.265 bitstream starts with an IDR NAL unit
+/// Check if an H.264/H.265 bitstream contains a keyframe (IDR/SPS)
 fn is_idr_frame(data: &[u8]) -> bool {
     if data.len() < 5 {
         return false;
     }
-    // Look for start code (0x00000001) then check NAL type
-    for i in 0..data.len().saturating_sub(5) {
-        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1 {
-            let nal_type = data[i + 4] & 0x1F;
-            // H.264 IDR = 5, H.265 IDR_W_RADL = 19, IDR_N_LP = 20
-            if nal_type == 5 || nal_type == 19 || nal_type == 20 {
+    // Scan for start codes (0x00000001 or 0x000001)
+    let mut i = 0;
+    while i + 4 < data.len() {
+        // Check for 4-byte start code
+        let (start_code_len, found) = if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1 {
+            (4, true)
+        } else if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            (3, true)
+        } else {
+            (0, false)
+        };
+
+        if found {
+            let nal_byte = data[i + start_code_len];
+
+            // H.265: NAL type is bits 1-6 of first byte (>> 1 & 0x3F)
+            let h265_nal_type = (nal_byte >> 1) & 0x3F;
+            // H.265 VPS=32, SPS=33, PPS=34, IDR_W_RADL=19, IDR_N_LP=20, CRA=21
+            if h265_nal_type == 32 || h265_nal_type == 33 || h265_nal_type == 34
+                || h265_nal_type == 19 || h265_nal_type == 20 || h265_nal_type == 21
+            {
                 return true;
             }
-            // H.264 SPS = 7 (typically precedes IDR in keyframes)
-            if nal_type == 7 {
+
+            // H.264: NAL type is bits 0-4 of first byte (& 0x1F)
+            let h264_nal_type = nal_byte & 0x1F;
+            // H.264 SPS=7, PPS=8, IDR=5
+            if h264_nal_type == 5 || h264_nal_type == 7 || h264_nal_type == 8 {
                 return true;
             }
+
+            i += start_code_len + 1;
+        } else {
+            i += 1;
+        }
+
+        // Only scan first 256 bytes — SPS/PPS/IDR are always at the start
+        if i > 256 {
+            break;
         }
     }
     false

@@ -10,7 +10,7 @@ path = "src/main.rs"
 [dependencies]
 bridge-common = { path = "../bridge-common" }
 bridge-transport = { path = "../bridge-transport" }
-bridge-video = { path = "../bridge-video" }
+bridge-video = { path = "../bridge-video", default-features = false }
 bridge-input = { path = "../bridge-input" }
 bridge-audio = { path = "../bridge-audio" }
 

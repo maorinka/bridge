@@ -910,11 +910,15 @@ impl VideoDecoder {
             return Ok(());
         }
 
+        // Convert data to AVCC format (4-byte length prefix) for VideoToolbox.
+        // GStreamer (Linux server) sends Annex B (start codes), macOS server sends AVCC.
+        let avcc_data = Self::ensure_avcc_format(&frame.data, self.codec);
+
         // For keyframes, strip parameter sets and only decode the slice data
         let decode_data = if frame.is_keyframe {
-            Self::strip_parameter_sets(&frame.data, self.codec)
+            Self::strip_parameter_sets(&avcc_data, self.codec)
         } else {
-            frame.data.to_vec()
+            avcc_data
         };
 
         if decode_data.is_empty() {
@@ -1124,6 +1128,13 @@ impl VideoDecoder {
 
     /// Try to parse AVCC format (4-byte length prefixed NAL units)
     fn try_parse_avcc<'a>(data: &'a [u8], units: &mut Vec<&'a [u8]>) -> bool {
+        // Quick check: if data starts with Annex B start code, it's NOT AVCC
+        if data.len() >= 4 && data[0] == 0 && data[1] == 0 {
+            if (data[2] == 0 && data[3] == 1) || data[2] == 1 {
+                return false; // Annex B start code detected
+            }
+        }
+
         let mut offset = 0;
         let mut found_valid = false;
 
@@ -1135,10 +1146,9 @@ impl VideoDecoder {
                 data[offset + 3],
             ]) as usize;
 
-            // Sanity check: length should be reasonable
-            if length == 0 || length > data.len() - offset - 4 {
+            // Sanity check: length should be reasonable (at least 2 bytes for a NAL header)
+            if length < 2 || length > data.len() - offset - 4 {
                 if !found_valid {
-                    // If we haven't found any valid units, this isn't AVCC format
                     units.clear();
                     return false;
                 }
@@ -1203,6 +1213,31 @@ impl VideoDecoder {
                 units.push(&data[start..]);
             }
         }
+    }
+
+    /// Convert Annex B format to AVCC format (4-byte length prefix) for VideoToolbox.
+    /// If data is already AVCC, returns it as-is.
+    fn ensure_avcc_format(data: &[u8], _codec: VideoCodec) -> Vec<u8> {
+        // Check if this is Annex B (starts with 0x00000001 or 0x000001)
+        let is_annex_b = data.len() >= 4 && data[0] == 0 && data[1] == 0
+            && ((data[2] == 0 && data[3] == 1) || data[2] == 1);
+
+        if !is_annex_b {
+            return data.to_vec(); // Already AVCC or unknown format
+        }
+
+        // Parse Annex B NAL units and convert to AVCC
+        let mut result = Vec::with_capacity(data.len());
+        let mut nal_units = Vec::new();
+        Self::parse_annex_b(data, &mut nal_units);
+
+        for nal in &nal_units {
+            let len = nal.len() as u32;
+            result.extend_from_slice(&len.to_be_bytes());
+            result.extend_from_slice(nal);
+        }
+
+        result
     }
 
     /// Extract H.264 parameter sets (SPS and PPS)

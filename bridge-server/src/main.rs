@@ -293,9 +293,15 @@ async fn handle_client(
     // Determine capture resolution and display ID
     // For Thunderbolt: always create virtual display at client's requested resolution
     // For other connections: use native display if resolution matches, otherwise try virtual
+    // On Linux, Xvfb creates a SEPARATE blank X server (unlike macOS CGVirtualDisplay which
+    // adds a virtual monitor to the existing display server). So on Linux with a physical
+    // display, always capture from it — don't create a blank Xvfb.
     let mut _virtual_display: Option<VirtualDisplay> = None;
+    #[cfg(target_os = "linux")]
+    let need_virtual_display = !has_physical_display; // Only use Xvfb if truly headless
+    #[cfg(not(target_os = "linux"))]
     let need_virtual_display = !has_physical_display
-        || is_thunderbolt  // Always use virtual display for Thunderbolt to guarantee resolution match
+        || is_thunderbolt
         || video_config.width != native_width
         || video_config.height != native_height;
 
@@ -361,7 +367,22 @@ async fn handle_client(
         None
     };
 
-    // Always capture at the negotiated resolution — CGDisplayStream handles scaling
+    // Determine capture resolution
+    // On macOS, CGDisplayStream handles scaling to any resolution.
+    // On Linux, X11 GetImage captures at native resolution — no scaling.
+    #[cfg(target_os = "linux")]
+    let (capture_width, capture_height) = if has_physical_display {
+        // X11 GetImage captures at native resolution. If native is >1080p,
+        // use 0x0 (native) for capture but the encoder will handle the full res.
+        // On Jetson Nano, the HW encoder maxes out at 1080p30 comfortably.
+        let cw = if native_width > 1920 { native_width } else { native_width };
+        let ch = if native_height > 1080 { native_height } else { native_height };
+        info!("Linux: capturing at {}x{}", cw, ch);
+        (cw, ch)
+    } else {
+        (video_config.width, video_config.height)
+    };
+    #[cfg(not(target_os = "linux"))]
     let (capture_width, capture_height) = if use_native_resolution_fallback && has_physical_display {
         (native_width, native_height)
     } else {
@@ -741,13 +762,21 @@ async fn handle_client(
                         }
                     }
                 } else if let Some(ref mut enc) = encoder {
-                    // Stage 1: Submit ALL captured frames to encoder (fast — just queues to VT)
+                    // Stage 1: Submit captured frames to encoder
+                    // On macOS, encode() is fast (queues to VT hardware) so drain all.
+                    // On Linux, encode() blocks on pipe write, so limit to 1 per tick.
+                    #[cfg(target_os = "macos")]
+                    let max_encode_per_tick = 16;
+                    #[cfg(not(target_os = "macos"))]
+                    let max_encode_per_tick = 1;
+
+                    let mut encoded_this_tick = 0u32;
                     while let Some(mut frame) = capturer.recv_frame() {
+                        if encoded_this_tick >= max_encode_per_tick {
+                            break;
+                        }
                         frames_this_tick += 1;
-                        #[cfg(target_os = "macos")]
-                        debug!("Encoding frame {} ({}x{}, IOSurface={})",
-                               frame.frame_number, frame.width, frame.height, frame.io_surface.is_some());
-                        #[cfg(not(target_os = "macos"))]
+                        encoded_this_tick += 1;
                         debug!("Encoding frame {} ({}x{})",
                                frame.frame_number, frame.width, frame.height);
                         if let Err(e) = enc.encode(&mut frame) {
@@ -755,7 +784,7 @@ async fn handle_client(
                         }
                     }
 
-                    // Stage 2: Send ALL encoded output (VT may have finished previous frames)
+                    // Stage 2: Send ALL encoded output
                     while let Some(encoded) = enc.recv_frame() {
                         debug!("Encoded frame: {} bytes, keyframe={}", encoded.data.len(), encoded.is_keyframe);
                         if let Some(video_ch) = conn.video_channel() {

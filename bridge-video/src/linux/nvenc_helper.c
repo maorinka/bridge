@@ -95,8 +95,8 @@ void *nvenc_create(int width, int height, int codec, int bitrate, int fps) {
     enc->write_fd = pipe_in[1];
     enc->read_fd = pipe_out[0];
 
-    /* Wait a moment for GStreamer to initialize */
-    usleep(500000);
+    /* Wait for GStreamer to initialize — NVIDIA encoder takes ~1-2s */
+    usleep(2000000);
 
     /* Check if child is still alive */
     int status;
@@ -136,7 +136,7 @@ int nvenc_encode_frame(void *handle, const unsigned char *nv12_data, int nv12_si
     struct pollfd pfd;
     pfd.fd = enc->read_fd;
     pfd.events = POLLIN;
-    int poll_ret = poll(&pfd, 1, 30);  /* 30ms timeout */
+    int poll_ret = poll(&pfd, 1, 100);  /* 100ms timeout — encoder pipeline has latency */
 
     if (poll_ret > 0 && (pfd.revents & POLLIN)) {
         int total_read = 0;

@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use tracing::{debug, info, warn};
 
+#[cfg(feature = "screencapturekit")]
 use super::sck_capture::SckBackend;
 use super::sys::*;
 use crate::capture::{CapturedFrame, CaptureConfig, CaptureStats, DisplayInfo};
@@ -24,6 +25,7 @@ struct CaptureContext {
 /// Active capture backend
 enum CaptureBackend {
     /// Modern ScreenCaptureKit (macOS 12.3+)
+    #[cfg(feature = "screencapturekit")]
     Sck(SckBackend),
     /// Legacy CGDisplayStream fallback
     CgDisplayStream {
@@ -95,6 +97,7 @@ impl ScreenCapturer {
         info!("Starting screen capture at {}fps", self.config.fps);
 
         // Try ScreenCaptureKit first (macOS 12.3+)
+        #[cfg(feature = "screencapturekit")]
         match SckBackend::start(
             &self.config,
             self.frame_tx.clone(),
@@ -215,6 +218,7 @@ impl ScreenCapturer {
         self.is_running.store(false, Ordering::SeqCst);
 
         match self.backend.take() {
+            #[cfg(feature = "screencapturekit")]
             Some(CaptureBackend::Sck(sck)) => {
                 if !self.is_stopped.load(Ordering::SeqCst) {
                     if let Err(e) = sck.stop() {

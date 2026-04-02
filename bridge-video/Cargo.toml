@@ -29,8 +29,12 @@ dispatch = { workspace = true }
 metal = { workspace = true }
 core-graphics-types = { workspace = true }
 
-# ScreenCaptureKit (modern macOS screen capture)
-screencapturekit = { version = "1.5", features = ["macos_14_0"] }
+# ScreenCaptureKit (modern macOS screen capture) - optional, requires full Xcode
+screencapturekit = { version = "1.5", features = ["macos_14_0"], optional = true }
+
+[features]
+default = ["screencapturekit"]
+sck = ["screencapturekit"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true }
