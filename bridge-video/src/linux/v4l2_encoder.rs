@@ -58,7 +58,7 @@ impl VideoEncoder {
         let codec = match config.codec {
             bridge_common::VideoCodec::H264 => 0,
             bridge_common::VideoCodec::H265 => 1,
-            bridge_common::VideoCodec::Raw => {
+            bridge_common::VideoCodec::Raw | bridge_common::VideoCodec::RawLz4 => {
                 return Err(BridgeError::Video("Raw codec doesn't need encoder".into()));
             }
         };
