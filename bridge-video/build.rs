@@ -22,6 +22,17 @@ fn main() {
 
     #[cfg(target_os = "linux")]
     {
+        // Compile NVIDIA V4L2 encoder helper
+        cc::Build::new()
+            .file("src/linux/nvenc_helper.c")
+            .include("/usr/src/jetson_multimedia_api/include")
+            .warnings(false)
+            .compile("nvenc_helper");
+
+        // Link NVIDIA V4L2 wrapper (provides v4l2_open/v4l2_ioctl/v4l2_mmap)
+        println!("cargo:rustc-link-search=native=/usr/lib/aarch64-linux-gnu/tegra");
+        println!("cargo:rustc-link-lib=dylib=nvv4l2");
+
         // Link X11/XCB libraries for screen capture
         println!("cargo:rustc-link-lib=X11");
         println!("cargo:rustc-link-lib=xcb");
