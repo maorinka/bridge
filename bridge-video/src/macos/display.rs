@@ -11,7 +11,7 @@ use tracing::{debug, info, trace, warn};
 use metal::{Device, CommandQueue, MTLPixelFormat, RenderPipelineState, MetalLayer, MTLClearColor};
 
 use crate::codec::DecodedFrame;
-use crate::sys::*;
+use super::sys::*;
 
 /// Metal-based video renderer
 pub struct MetalDisplay {

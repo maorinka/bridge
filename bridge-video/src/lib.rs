@@ -1,29 +1,40 @@
 //! Bridge Video Subsystem
 //!
-//! Provides low-latency video capture, encoding, decoding, and display:
-//! - Screen capture via ScreenCaptureKit (macOS 12.3+)
-//! - Hardware encoding/decoding via VideoToolbox
-//! - Metal-based rendering for display
+//! Provides low-latency video capture, encoding, decoding, and display.
+//!
+//! Shared types (CapturedFrame, EncodedFrame, etc.) live in the top-level modules.
+//! Platform-specific implementations live in `macos/` and `linux/` subdirectories.
 
 pub mod capture;
 pub mod codec;
-pub mod display;
-pub mod virtual_display;
-mod sck_capture;
-mod sys;
+
+#[cfg(target_os = "macos")]
+pub mod macos;
+
+#[cfg(target_os = "linux")]
+pub mod linux;
 
 pub use capture::*;
 pub use codec::*;
-pub use display::*;
+
+// Re-export platform-specific implementations
+#[cfg(target_os = "macos")]
+pub use macos::capture::{ScreenCapturer, get_displays, is_capture_supported};
+#[cfg(target_os = "macos")]
+pub use macos::codec::{VideoEncoder, VideoDecoder};
+#[cfg(target_os = "macos")]
+pub use macos::display::{MetalDisplay, DisplayStats};
+
+#[cfg(target_os = "macos")]
+pub mod virtual_display {
+    pub use crate::macos::virtual_display::*;
+}
 
 use bridge_common::{VideoConfig, VideoCodec, PixelFormat};
 
-// is_capture_supported is re-exported from capture module
-
 /// Check if hardware encoding is available
 pub fn is_hw_encoding_available() -> bool {
-    // VideoToolbox hardware encoding is available on all Apple Silicon Macs
-    cfg!(target_os = "macos")
+    cfg!(any(target_os = "macos", target_os = "linux"))
 }
 
 /// Calculate bytes per frame for a given configuration
