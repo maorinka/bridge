@@ -1,0 +1,20 @@
+# Cross-compilation configuration for cross-rs
+# Usage: cross build --target aarch64-unknown-linux-gnu -p bridge-server
+#
+# Install cross: cargo install cross
+# Requires Docker or Podman.
+
+[target.aarch64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main"
+pre-build = [
+    "dpkg --add-architecture arm64",
+    "apt-get update",
+    "apt-get install -y libx11-dev:arm64 libxcb1-dev:arm64 libxcb-shm0-dev:arm64 libxtst-dev:arm64 libasound2-dev:arm64"
+]
+
+[target.x86_64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:main"
+pre-build = [
+    "apt-get update",
+    "apt-get install -y libx11-dev libxcb1-dev libxcb-shm0-dev libxtst-dev libasound2-dev"
+]
