@@ -15,8 +15,7 @@ use bridge_transport::{
     discovery::get_local_addresses,
 };
 use bridge_video::{CaptureConfig, EncoderConfig, ScreenCapturer, VideoEncoder, get_displays, virtual_display::{VirtualDisplay, is_virtual_display_supported}};
-// TODO: Input disabled - focus on video first
-// use bridge_input::InputInjector;
+use bridge_input::InputInjector;
 use bridge_audio::AudioCapturer;
 use clap::Parser;
 use tracing::{debug, error, info, warn, Level};
@@ -438,8 +437,16 @@ async fn handle_client(
     // Audio disabled — focusing on video first
     let mut audio_capturer: Option<AudioCapturer> = None;
 
-    // TODO: Input disabled - focus on video first
-    // let mut input_injector = InputInjector::new()?;
+    let mut input_injector = match InputInjector::new() {
+        Ok(inj) => {
+            info!("Input injector initialized");
+            Some(inj)
+        }
+        Err(e) => {
+            warn!("Input injection unavailable: {}. Continuing without input.", e);
+            None
+        }
+    };
 
     let mut is_streaming = false;
     let mut video_frame_number: u64 = 0;
@@ -508,31 +515,30 @@ async fn handle_client(
 
     // Audio ping skipped — audio disabled
 
-    // TODO: Input disabled - focus on video first
-    // if let Some(input_ch) = conn.input_channel() {
-    //     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    //     loop {
-    //         match tokio::time::timeout(
-    //             std::time::Duration::from_millis(50),
-    //             input_ch.recv()
-    //         ).await {
-    //             Ok(Ok((header, _))) => {
-    //                 debug!("Received input ping from client (type: {:?})", header.packet_type);
-    //                 break;
-    //             }
-    //             Ok(Err(e)) => {
-    //                 warn!("Error receiving input ping: {}", e);
-    //                 break;
-    //             }
-    //             Err(_) => {
-    //                 if tokio::time::Instant::now() > deadline {
-    //                     warn!("Timeout waiting for input ping");
-    //                     break;
-    //                 }
-    //             }
-    //         }
-    //     }
-    // }
+    if let Some(input_ch) = conn.input_channel() {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                input_ch.recv()
+            ).await {
+                Ok(Ok((header, _))) => {
+                    debug!("Received input ping from client (type: {:?})", header.packet_type);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    warn!("Error receiving input ping: {}", e);
+                    break;
+                }
+                Err(_) => {
+                    if tokio::time::Instant::now() > deadline {
+                        warn!("Timeout waiting for input ping");
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
     info!("UDP channels initialized");
 
@@ -870,21 +876,23 @@ async fn handle_client(
             }
         }
 
-        // TODO: Input disabled - focus on video first
-        // if let Some(input_ch) = conn.input_channel() {
-        //     while let Ok(Ok((header, data))) = tokio::time::timeout(
-        //         std::time::Duration::from_micros(100),
-        //         input_ch.recv()
-        //     ).await {
-        //         if header.packet_type == bridge_common::PacketType::Input {
-        //             if let Ok(event) = InputEvent::from_bytes(&data) {
-        //                 if let Err(e) = input_injector.inject(&event) {
-        //                     debug!("Input injection error: {}", e);
-        //                 }
-        //             }
-        //         }
-        //     }
-        // }
+        // Process input events from client
+        if let Some(ref mut injector) = input_injector {
+            if let Some(input_ch) = conn.input_channel() {
+                while let Ok(Ok((header, data))) = tokio::time::timeout(
+                    std::time::Duration::from_micros(100),
+                    input_ch.recv()
+                ).await {
+                    if header.packet_type == bridge_common::PacketType::Input {
+                        if let Ok(event) = bridge_common::InputEvent::from_bytes(&data) {
+                            if let Err(e) = injector.inject(&event) {
+                                debug!("Input injection error: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Clean up

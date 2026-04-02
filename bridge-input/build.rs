@@ -10,8 +10,6 @@ fn main() {
 
     #[cfg(target_os = "linux")]
     {
-        // Link X11 for input injection via XTest extension
-        println!("cargo:rustc-link-lib=x11");
-        println!("cargo:rustc-link-lib=xtst");
+        // uinput uses kernel ioctls directly, no extra libraries needed
     }
 }
